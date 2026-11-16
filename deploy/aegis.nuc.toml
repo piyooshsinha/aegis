@@ -85,9 +85,11 @@ base_url = "http://127.0.0.1:11437/v1"
 tier = "local"
 timeout_secs = 60
 
+  # Ollama loads this model with a 2048-token context and silently truncates
+  # longer inputs, so longer ones are refused here instead.
   [[providers.models]]
   id = "nomic-embed-text"
-  context_window = 8192
+  context_window = 2048
   capabilities = ["embeddings"]
 
 [[providers]]
