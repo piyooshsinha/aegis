@@ -31,7 +31,7 @@ scope = "per_key"   # or "global" to share entries between client keys
 # default. Responses served this way carry `x-aegis-cache: semantic`; a client
 # can opt out per request with `x-aegis-cache: exact`.
 [cache.semantic]
-enabled = false
+enabled = true
 embedding_model = "ollama/nomic-embed-text"   # needs the "embeddings" capability
 threshold = 0.95      # minimum cosine similarity; lower matches more loosely
 max_entries = 2000
