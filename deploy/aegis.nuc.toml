@@ -1,0 +1,149 @@
+# Aegis configuration.
+#
+# Secrets do not go in this file. Each provider names the environment variable
+# that holds its key (api_key_env); a provider whose variable is unset is
+# skipped by the router and shown as "not set" in the dashboard.
+#
+# Model ids, prices and free-tier limits change. Check them against each
+# provider's current documentation before relying on the cost figures.
+
+[server]
+bind = "0.0.0.0:9001"
+db_path = "data/aegis.db"
+retention_days = 30
+
+[auth]
+required = true
+
+[cache]
+enabled = true
+ttl_secs = 3600
+max_entries = 10000
+# Only requests with temperature <= this (or a seed) are cached, so sampled
+# requests keep varying. Override per request with `x-aegis-cache: force|bypass`.
+max_temperature = 0.0
+cache_when_temperature_unset = false
+scope = "per_key"   # or "global" to share entries between client keys
+
+# ---- providers -------------------------------------------------------------
+
+[[providers]]
+name = "ollama"
+kind = "openai"
+base_url = "http://127.0.0.1:11435/v1"
+tier = "local"
+timeout_secs = 300
+
+  [[providers.models]]
+  id = "qwen2.5:7b"
+  context_window = 32768
+  capabilities = ["tools", "json"]
+
+  [[providers.models]]
+  id = "qwen2.5-coder:3b"
+  context_window = 32768
+  capabilities = ["json"]
+
+[[providers]]
+name = "groq"
+kind = "openai"
+base_url = "https://api.groq.com/openai/v1"
+api_key_env = "GROQ_API_KEY"
+tier = "free"
+
+  [[providers.models]]
+  id = "llama-3.1-8b-instant"
+  context_window = 131072
+  capabilities = ["tools", "json"]
+  limits = { rpm = 30, rpd = 14400, tpm = 6000, tpd = 500000 }
+
+  [[providers.models]]
+  id = "llama-3.3-70b-versatile"
+  context_window = 131072
+  capabilities = ["tools", "json"]
+  limits = { rpm = 30, rpd = 1000, tpm = 12000, tpd = 100000 }
+
+[[providers]]
+name = "gemini"
+kind = "gemini"
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+api_key_env = "GEMINI_API_KEY"
+tier = "free"
+
+  [[providers.models]]
+  id = "gemini-2.5-flash"
+  context_window = 1048576
+  capabilities = ["tools", "vision", "json"]
+  limits = { rpm = 10, rpd = 250, tpm = 250000 }
+
+[[providers]]
+name = "anthropic"
+kind = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key_env = "ANTHROPIC_API_KEY"
+tier = "paid"
+timeout_secs = 600
+
+  [[providers.models]]
+  id = "claude-haiku-5-5"
+  context_window = 1000000
+  max_output = 64000
+  capabilities = ["tools", "vision"]
+  input_per_mtok = 0.10
+  output_per_mtok = 0.50
+
+  [[providers.models]]
+  id = "claude-sonnet-5-5"
+  context_window = 1000000
+  max_output = 64000
+  capabilities = ["tools", "vision"]
+  input_per_mtok = 2.00
+  output_per_mtok = 10.00
+
+  [[providers.models]]
+  id = "claude-opus-5-5"
+  context_window = 1000000
+  max_output = 64000
+  capabilities = ["tools", "vision"]
+  input_per_mtok = 4.00
+  output_per_mtok = 20.00
+
+[[providers]]
+name = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+tier = "paid"
+
+  [[providers.models]]
+  id = "gpt-4o-mini"
+  context_window = 128000
+  capabilities = ["tools", "vision", "json"]
+  input_per_mtok = 0.15
+  output_per_mtok = 0.60
+
+# ---- routes ----------------------------------------------------------------
+# Targets are tried in order. One is skipped when its key is unset, it lacks a
+# capability the request needs, the request exceeds its context window, its
+# quota is used up, or it is cooling down after errors. Paid targets are only
+# used for client keys that allow it.
+
+[[routes]]
+alias = "fast-model"
+description = "Cheapest quick answer: free tier, then local, then paid"
+targets = ["groq/llama-3.1-8b-instant", "ollama/qwen2.5:7b", "anthropic/claude-haiku-5-5"]
+
+[[routes]]
+alias = "smart-model"
+description = "Best quality available, free first"
+targets = ["groq/llama-3.3-70b-versatile", "gemini/gemini-2.5-flash", "anthropic/claude-sonnet-5-5"]
+
+[[routes]]
+alias = "local-model"
+description = "Never leaves this machine"
+targets = ["ollama/qwen2.5:7b", "ollama/qwen2.5-coder:3b"]
+
+[[routes]]
+alias = "vision-model"
+description = "Image input"
+targets = ["gemini/gemini-2.5-flash", "anthropic/claude-haiku-5-5", "openai/gpt-4o-mini"]

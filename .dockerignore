@@ -1,0 +1,6 @@
+target/
+data/
+.git/
+deploy/.env
+*.md
+tests/

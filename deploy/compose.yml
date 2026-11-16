@@ -1,0 +1,22 @@
+# Aegis on the NUC. Host networking lets the gateway reach the Ollama
+# listener on 127.0.0.1:11435. The port is set by `bind` in aegis.nuc.toml;
+# keep the healthcheck below in step with it.
+services:
+  aegis:
+    build: ..
+    image: aegis-gateway:latest
+    container_name: aegis
+    restart: unless-stopped
+    network_mode: host
+    env_file: .env
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9001/healthz"]
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+    volumes:
+      - ./aegis.nuc.toml:/app/aegis.toml:ro
+      - aegis-data:/app/data
+
+volumes:
+  aegis-data:
