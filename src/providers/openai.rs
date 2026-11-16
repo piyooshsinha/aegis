@@ -23,7 +23,7 @@ fn body(model: &ModelCfg, req: &ChatRequest, stream: bool) -> Value {
 
 fn request(a: &Adapter, body: &Value) -> reqwest::RequestBuilder {
     let mut rb = a.client.post(format!("{}/chat/completions", a.base_url)).json(body);
-    if let Some(k) = &a.api_key {
+    if let Some(k) = a.api_key() {
         rb = rb.bearer_auth(k);
     }
     rb

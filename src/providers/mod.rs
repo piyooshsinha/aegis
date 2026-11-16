@@ -11,6 +11,7 @@ use futures::Stream;
 use reqwest::header::HeaderMap;
 use serde_json::Value;
 use std::pin::Pin;
+use std::sync::RwLock;
 use std::time::Duration;
 
 pub type ChunkStream = Pin<Box<dyn Stream<Item = Result<Value, ProviderError>> + Send>>;
@@ -141,18 +142,28 @@ pub async fn error_from_response(resp: reqwest::Response) -> ProviderError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    Dashboard,
+    Env,
+    Unset,
+}
+
 pub struct Adapter {
     pub name: String,
     pub kind: ProviderKind,
     pub base_url: String,
-    pub api_key: Option<String>,
+    /// Key from the provider's environment variable, read at startup.
+    env_key: Option<String>,
+    /// Key set from the dashboard; takes precedence and can change at runtime.
+    stored_key: RwLock<Option<String>>,
     pub timeout: Duration,
     pub client: reqwest::Client,
 }
 
 impl Adapter {
     pub fn new(p: &ProviderCfg) -> anyhow::Result<Self> {
-        let api_key = if p.api_key_env.is_empty() {
+        let env_key = if p.api_key_env.is_empty() {
             None
         } else {
             std::env::var(&p.api_key_env).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
@@ -167,10 +178,29 @@ impl Adapter {
             name: p.name.clone(),
             kind: p.kind,
             base_url: p.base_url.trim_end_matches('/').to_string(),
-            api_key,
+            env_key,
+            stored_key: RwLock::new(None),
             timeout,
             client,
         })
+    }
+
+    pub fn api_key(&self) -> Option<String> {
+        self.stored_key.read().unwrap_or_else(|e| e.into_inner()).clone().or_else(|| self.env_key.clone())
+    }
+
+    pub fn key_source(&self) -> KeySource {
+        if self.stored_key.read().unwrap_or_else(|e| e.into_inner()).is_some() {
+            KeySource::Dashboard
+        } else if self.env_key.is_some() {
+            KeySource::Env
+        } else {
+            KeySource::Unset
+        }
+    }
+
+    pub fn set_stored_key(&self, key: Option<String>) {
+        *self.stored_key.write().unwrap_or_else(|e| e.into_inner()) = key;
     }
 
     pub async fn complete(&self, model: &ModelCfg, req: &ChatRequest) -> Result<(Completion, RateSnapshot), ProviderError> {

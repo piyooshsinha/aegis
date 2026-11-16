@@ -36,7 +36,7 @@ Request headers: `x-aegis-cache: bypass` or `force`, and
 
 ```bash
 export AEGIS_ADMIN_TOKEN=choose-a-long-secret   # dashboard sign-in
-export GROQ_API_KEY=...                         # any providers you have
+export AEGIS_SECRET_KEY=$(openssl rand -hex 32) # lets you save provider keys in the dashboard
 cargo run --release -- serve                    # reads ./aegis.toml
 cargo run --release -- key create --name my-app # prints a client key once
 ```
@@ -44,6 +44,21 @@ cargo run --release -- key create --name my-app # prints a client key once
 Dashboard: `http://HOST:8787/ui`. Other commands: `aegis check`,
 `aegis key list`, `aegis key revoke <id>`. Keys can also be created and
 revoked in the dashboard, which takes effect immediately.
+
+### Provider API keys
+
+There are two ways to give a provider its key:
+
+- **Dashboard** (needs `AEGIS_SECRET_KEY`): open Providers, choose "Set API
+  key" and paste it. The key is encrypted with XChaCha20-Poly1305 before it is
+  written to SQLite, is used from the next request with no restart, and is
+  never shown again (only its last four characters are).
+- **Environment**: set the variable named by the provider's `api_key_env`
+  (for example `GROQ_API_KEY`) before starting.
+
+A key saved in the dashboard takes precedence over the environment. Keep
+`AEGIS_SECRET_KEY` unchanged: keys saved under a different value cannot be
+decrypted and must be entered again.
 
 ## How the design gaps were closed
 
@@ -66,8 +81,8 @@ revoked in the dashboard, which takes effect immediately.
   tried and why. A provider's 4xx rejection is returned as-is, not retried.
 - **Auth.** Client keys are random, shown once and stored as SHA-256 hashes,
   with optional requests-per-minute, daily budget, model allow-list and a
-  paid-tier permission. Provider keys come only from environment variables.
-  The dashboard needs the admin token.
+  paid-tier permission. Provider keys come from environment variables or are
+  stored encrypted from the dashboard. The dashboard needs the admin token.
 - **Health.** Three consecutive failures open a circuit breaker with backoff.
 
 ## Configuration

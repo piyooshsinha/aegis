@@ -178,7 +178,7 @@ targets = ["midfail/m", "good/m"]
         db = db.display(),
     ))
     .unwrap();
-    let state = AppState::build(cfg, "admin-secret".into()).await.unwrap();
+    let state = AppState::build(cfg, "admin-secret".into(), Some(aegis::secrets::Sealer::new("e2e-test-secret-0123456789abcdef0123").unwrap())).await.unwrap();
 
     let key = generate_key();
     state.db.create_key("full", "aegis_sk_full", &hash_key(&key), None, Some(5.0), true, "").await.unwrap();
@@ -426,4 +426,52 @@ async fn dashboard_requires_sign_in() {
     // The playground endpoint refuses unauthenticated callers.
     let r = client.post(format!("{}/ui/playground/chat", h.base)).json(&msg("good/m", "hi")).send().await.unwrap();
     assert_eq!(r.status(), 401);
+}
+
+#[tokio::test]
+async fn provider_key_set_from_dashboard_is_encrypted_and_used_at_once() {
+    let h = harness().await;
+    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let form = |path: &str, body: &str| {
+        client.post(format!("{}{path}", h.base)).body(body.to_string()).header("content-type", "application/x-www-form-urlencoded")
+    };
+
+    // No key yet: the target is skipped.
+    assert_eq!(h.chat(&h.key, msg("nokey/m", "hi")).await.status(), 503);
+
+    // Saving a key needs a signed-in admin.
+    let r = form("/ui/providers/key", "provider=nokey&key=sk-test-provider-key-1234").send().await.unwrap();
+    assert_eq!(r.status(), 303);
+    assert!(h.state.adapters["nokey"].api_key().is_none());
+
+    let r = form("/ui/login", "token=admin-secret").send().await.unwrap();
+    let cookie = r.headers().get("set-cookie").unwrap().to_str().unwrap().split(';').next().unwrap().to_string();
+
+    let r = form("/ui/providers/key", "provider=nokey&key=has+spaces").header("cookie", &cookie).send().await.unwrap();
+    assert_eq!(r.status(), 400);
+    let r = form("/ui/providers/key", "provider=good&key=sk-test-provider-key-1234").header("cookie", &cookie).send().await.unwrap();
+    assert_eq!(r.status(), 400, "providers without api_key_env take no key");
+
+    let r = form("/ui/providers/key", "provider=nokey&key=sk-test-provider-key-1234").header("cookie", &cookie).send().await.unwrap();
+    assert_eq!(r.status(), 303);
+
+    // Used without a restart, and stored only as ciphertext.
+    let r = h.chat(&h.key, msg("nokey/m", "hi")).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(hdr(&r, "x-aegis-provider"), "nokey");
+    let rows = h.state.db.list_provider_keys().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].hint, "1234");
+    assert!(!String::from_utf8_lossy(&rows[0].ciphertext).contains("sk-test"));
+    let opened = h.state.sealer.as_ref().unwrap().open("nokey", &rows[0].nonce, &rows[0].ciphertext).unwrap();
+    assert_eq!(opened, "sk-test-provider-key-1234");
+
+    // The page shows the hint, never the key.
+    let page = client.get(format!("{}/ui/providers", h.base)).header("cookie", &cookie).send().await.unwrap().text().await.unwrap();
+    assert!(page.contains("1234") && !page.contains("sk-test-provider-key"));
+
+    let r = form("/ui/providers/key/remove", "provider=nokey").header("cookie", &cookie).send().await.unwrap();
+    assert_eq!(r.status(), 303);
+    assert_eq!(h.chat(&h.key, msg("nokey/m", "hi")).await.status(), 503);
+    assert!(h.state.db.list_provider_keys().await.unwrap().is_empty());
 }

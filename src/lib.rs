@@ -8,6 +8,7 @@ pub mod db;
 pub mod gateway;
 pub mod providers;
 pub mod quota;
+pub mod secrets;
 pub mod types;
 pub mod ui;
 

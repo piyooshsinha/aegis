@@ -7,6 +7,7 @@ use crate::config::{Config, ModelCfg, ProviderCfg, Tier};
 use crate::db::{Db, RequestRecord};
 use crate::providers::{Adapter, ChunkStream, ProviderError};
 use crate::quota::QuotaTracker;
+use crate::secrets::Sealer;
 use crate::types::{ChatRequest, Usage, chunk_json, completion_json, est_tokens, new_completion_id, now_ms, usage_chunk_json};
 use axum::Json;
 use axum::extract::State;
@@ -30,6 +31,10 @@ pub struct AppState {
     pub keys: KeyStore,
     pub telemetry: UnboundedSender<RequestRecord>,
     pub admin_token: String,
+    /// Present when `AEGIS_SECRET_KEY` is set; needed to store provider keys.
+    pub sealer: Option<Sealer>,
+    /// provider -> (hint, updated_at ms) for keys stored from the dashboard.
+    pub stored_keys: Mutex<HashMap<String, (String, i64)>>,
     pub sessions: Mutex<HashSet<String>>,
     pub started: Instant,
 }
@@ -44,11 +49,27 @@ pub struct Target {
 }
 
 impl AppState {
-    pub async fn build(cfg: Config, admin_token: String) -> anyhow::Result<Shared> {
+    pub async fn build(cfg: Config, admin_token: String, sealer: Option<Sealer>) -> anyhow::Result<Shared> {
         let db = Db::open(&cfg.server.db_path).await?;
         let mut adapters = HashMap::new();
         for p in &cfg.providers {
             adapters.insert(p.name.clone(), Adapter::new(p)?);
+        }
+        // Keys saved from the dashboard override the environment.
+        let mut stored_keys = HashMap::new();
+        for row in db.list_provider_keys().await? {
+            let Some(adapter) = adapters.get(&row.provider) else { continue };
+            let Some(sealer) = &sealer else {
+                tracing::warn!(provider = %row.provider, "stored provider key ignored: {} is not set", crate::secrets::SECRET_ENV);
+                continue;
+            };
+            match sealer.open(&row.provider, &row.nonce, &row.ciphertext) {
+                Ok(key) => {
+                    adapter.set_stored_key(Some(key));
+                    stored_keys.insert(row.provider, (row.hint, row.updated_at));
+                }
+                Err(e) => tracing::warn!("{e}"),
+            }
         }
         let keys = KeyStore::default();
         keys.reload(&db).await?;
@@ -70,6 +91,8 @@ impl AppState {
             keys,
             telemetry,
             admin_token,
+            sealer,
+            stored_keys: Mutex::new(stored_keys),
             sessions: Mutex::new(HashSet::new()),
             started: Instant::now(),
         }))
@@ -101,14 +124,46 @@ impl AppState {
             .collect()
     }
 
+    /// Encrypt and save a provider key, and start using it immediately.
+    pub async fn set_provider_key(&self, provider: &str, key: &str) -> anyhow::Result<()> {
+        let sealer = self.sealer.as_ref().ok_or_else(|| anyhow::anyhow!("{} is not set", crate::secrets::SECRET_ENV))?;
+        let adapter = self.adapters.get(provider).ok_or_else(|| anyhow::anyhow!("unknown provider {provider}"))?;
+        let sealed = sealer.seal(provider, key)?;
+        let hint = crate::secrets::hint(key);
+        self.db.set_provider_key(provider, &sealed.nonce, &sealed.ciphertext, &hint).await?;
+        adapter.set_stored_key(Some(key.to_string()));
+        self.stored_keys.lock().unwrap_or_else(|e| e.into_inner()).insert(provider.to_string(), (hint, now_ms()));
+        self.clear_provider_state(provider);
+        Ok(())
+    }
+
+    /// Remove a stored key; the provider goes back to its environment variable.
+    pub async fn remove_provider_key(&self, provider: &str) -> anyhow::Result<()> {
+        let adapter = self.adapters.get(provider).ok_or_else(|| anyhow::anyhow!("unknown provider {provider}"))?;
+        self.db.delete_provider_key(provider).await?;
+        adapter.set_stored_key(None);
+        self.stored_keys.lock().unwrap_or_else(|e| e.into_inner()).remove(provider);
+        self.clear_provider_state(provider);
+        Ok(())
+    }
+
+    /// A new key deserves a fresh start: drop cooldowns earned by the old one.
+    fn clear_provider_state(&self, provider: &str) {
+        if let Some(p) = self.cfg.providers.iter().find(|p| p.name == provider) {
+            for m in &p.models {
+                self.quota.reset(&format!("{}/{}", p.name, m.id));
+            }
+        }
+    }
+
     /// Why this target cannot serve this request, if it cannot.
     fn ineligible(&self, t: &Target, needs: &Needs, ident: &Identity) -> Option<String> {
         let (p, m) = self.parts(t);
         if p.tier == Tier::Paid && !ident.allow_paid {
             return Some("client key may not use paid providers".into());
         }
-        if !p.api_key_env.is_empty() && self.adapters.get(&p.name).is_none_or(|a| a.api_key.is_none()) {
-            return Some(format!("not configured ({} is unset)", p.api_key_env));
+        if !p.api_key_env.is_empty() && self.adapters.get(&p.name).is_none_or(|a| a.api_key().is_none()) {
+            return Some(format!("not configured (no API key; {} is unset)", p.api_key_env));
         }
         for (needed, cap) in [(needs.tools, "tools"), (needs.vision, "vision"), (needs.json, "json")] {
             if needed && !m.has(cap) {

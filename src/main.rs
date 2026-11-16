@@ -116,10 +116,17 @@ async fn serve(cfg: Config) -> Result<()> {
     };
     let bind = cfg.server.bind.clone();
     for p in &cfg.providers {
-        let configured = p.api_key_env.is_empty() || std::env::var(&p.api_key_env).is_ok_and(|v| !v.trim().is_empty());
-        tracing::info!(provider = %p.name, tier = p.tier.as_str(), models = p.models.len(), configured, "provider");
+        let env_key = p.api_key_env.is_empty() || std::env::var(&p.api_key_env).is_ok_and(|v| !v.trim().is_empty());
+        tracing::info!(provider = %p.name, tier = p.tier.as_str(), models = p.models.len(), env_key, "provider");
     }
-    let state = AppState::build(cfg, admin_token).await?;
+    let sealer = match std::env::var(aegis::secrets::SECRET_ENV).ok().filter(|v| !v.trim().is_empty()) {
+        Some(secret) => Some(aegis::secrets::Sealer::new(&secret)?),
+        None => {
+            tracing::info!("{} is not set: provider keys can only come from environment variables", aegis::secrets::SECRET_ENV);
+            None
+        }
+    };
+    let state = AppState::build(cfg, admin_token, sealer).await?;
     let app = aegis::router(state);
     let listener = tokio::net::TcpListener::bind(&bind).await.with_context(|| format!("binding {bind}"))?;
     tracing::info!("Aegis listening on http://{bind} (dashboard at /ui)");

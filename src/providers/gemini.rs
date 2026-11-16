@@ -141,7 +141,7 @@ fn body(model: &ModelCfg, req: &ChatRequest) -> Value {
 fn request(a: &Adapter, model: &ModelCfg, method: &str, body: &Value) -> reqwest::RequestBuilder {
     a.client
         .post(format!("{}/models/{}:{}", a.base_url, model.id, method))
-        .header("x-goog-api-key", a.api_key.as_deref().unwrap_or(""))
+        .header("x-goog-api-key", a.api_key().unwrap_or_default())
         .json(body)
 }
 

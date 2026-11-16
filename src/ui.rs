@@ -6,6 +6,7 @@
 use crate::auth::{Identity, constant_time_eq, generate_key, hash_key, random_token};
 use crate::db::{HourBucket, RequestRecord};
 use crate::gateway::{ChatOpts, Shared, run_chat};
+use crate::providers::KeySource;
 use crate::types::{ChatRequest, now_ms};
 use axum::extract::{Form, Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -28,6 +29,8 @@ pub fn routes() -> Router<Shared> {
         .route("/ui/requests", get(requests))
         .route("/ui/providers", get(providers))
         .route("/ui/providers/reset", post(reset_target))
+        .route("/ui/providers/key", post(set_provider_key))
+        .route("/ui/providers/key/remove", post(remove_provider_key))
         .route("/ui/keys", get(keys).post(create_key))
         .route("/ui/keys/{id}/revoke", post(revoke_key))
         .route("/ui/cache", get(cache))
@@ -397,7 +400,13 @@ fn meter(label: &str, used: u64, limit: Option<u64>) -> Markup {
 
 async fn providers(State(state): State<Shared>, headers: HeaderMap) -> Response {
     require_admin!(state, headers);
+    providers_view(&state, None).into_response()
+}
+
+fn providers_view(state: &Shared, error: Option<String>) -> Markup {
+    let stored = state.stored_keys.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let body = html! {
+        @if let Some(e) = &error { p.alert { (e) } }
         section.card {
             h2 { "Routes" }
             p.muted { "A request for an alias goes to the first target that is configured, capable of the request, and within quota." }
@@ -415,13 +424,45 @@ async fn providers(State(state): State<Shared>, headers: HeaderMap) -> Response 
             } }
         }
         @for p in &state.cfg.providers {
-            @let configured = p.api_key_env.is_empty() || state.adapters.get(&p.name).is_some_and(|a| a.api_key.is_some());
+            @let needs_key = !p.api_key_env.is_empty();
+            @let source = state.adapters.get(&p.name).map_or(KeySource::Unset, |a| a.key_source());
+            @let configured = !needs_key || source != KeySource::Unset;
             section.card {
                 div.card-head {
                     h2 { (p.name) " " (tier_badge(p.tier.as_str())) }
-                    @if configured { (badge("ok", "configured")) } @else { (badge("bad", &format!("{} not set", p.api_key_env))) }
+                    @if !needs_key { (badge("ok", "no key needed")) }
+                    @else if source == KeySource::Dashboard {
+                        @let hint = stored.get(&p.name).map(|s| s.0.as_str()).unwrap_or("");
+                        (badge("ok", &if hint.is_empty() { "key saved here".to_string() } else { format!("key saved here ····{hint}") }))
+                    }
+                    @else if source == KeySource::Env { (badge("ok", &format!("key from {}", p.api_key_env))) }
+                    @else { (badge("bad", "no API key")) }
                 }
                 p.muted { (p.kind.as_str()) " · " span.mono { (p.base_url) } }
+                @if needs_key {
+                    @if state.sealer.is_some() {
+                        details.keybox {
+                            summary { @if source == KeySource::Dashboard { "Replace API key" } @else { "Set API key" } }
+                            p.muted {
+                                "The key is encrypted before it is saved, takes effect immediately, and cannot be shown again."
+                                @if source == KeySource::Env { " It will be used instead of " span.mono { (p.api_key_env) } "." }
+                            }
+                            form.key-row method="post" action="/ui/providers/key" {
+                                input type="hidden" name="provider" value=(p.name);
+                                input type="password" name="key" placeholder="Paste the provider API key" autocomplete="off" spellcheck="false" required maxlength="500";
+                                button.primary type="submit" { "Save key" }
+                            }
+                            @if source == KeySource::Dashboard {
+                                form.inline method="post" action="/ui/providers/key/remove" data-confirm=(format!("Remove the saved key for {}?", p.name)) {
+                                    input type="hidden" name="provider" value=(p.name);
+                                    button.ghost.small.danger type="submit" { "Remove saved key" }
+                                }
+                            }
+                        }
+                    } @else {
+                        p.muted { "To set this key from the dashboard, start Aegis with " span.mono { (crate::secrets::SECRET_ENV) } ". Until then it is read from " span.mono { (p.api_key_env) } "." }
+                    }
+                }
                 @for m in &p.models {
                     @let key = format!("{}/{}", p.name, m.id);
                     @let v = state.quota.view(&key);
@@ -452,7 +493,47 @@ async fn providers(State(state): State<Shared>, headers: HeaderMap) -> Response 
             }
         }
     };
-    page("Providers", "/ui/providers", true, body).into_response()
+    page("Providers", "/ui/providers", true, body)
+}
+
+#[derive(Deserialize)]
+struct ProviderKeyForm {
+    provider: String,
+    #[serde(default)]
+    key: String,
+}
+
+async fn set_provider_key(State(state): State<Shared>, headers: HeaderMap, Form(f): Form<ProviderKeyForm>) -> Response {
+    require_admin!(state, headers);
+    let key = f.key.trim();
+    let needs_key = state.cfg.providers.iter().any(|p| p.name == f.provider && !p.api_key_env.is_empty());
+    let problem = if !needs_key {
+        Some("That provider does not take an API key.".to_string())
+    } else if key.is_empty() {
+        Some("Paste a key before saving.".to_string())
+    } else if key.len() > 500 || !key.chars().all(|c| c.is_ascii_graphic()) {
+        Some("That does not look like an API key: it has spaces or unusual characters.".to_string())
+    } else {
+        state.set_provider_key(&f.provider, key).await.err().map(|e| format!("Could not save the key: {e}"))
+    };
+    match problem {
+        Some(e) => (StatusCode::BAD_REQUEST, providers_view(&state, Some(e))).into_response(),
+        None => {
+            tracing::info!(provider = %f.provider, "provider key set from dashboard");
+            Redirect::to("/ui/providers").into_response()
+        }
+    }
+}
+
+async fn remove_provider_key(State(state): State<Shared>, headers: HeaderMap, Form(f): Form<ProviderKeyForm>) -> Response {
+    require_admin!(state, headers);
+    match state.remove_provider_key(&f.provider).await {
+        Ok(()) => {
+            tracing::info!(provider = %f.provider, "provider key removed from dashboard");
+            Redirect::to("/ui/providers").into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, providers_view(&state, Some(format!("Could not remove the key: {e}")))).into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -754,6 +835,10 @@ button.ghost{background:transparent;color:var(--muted)}
 button.small{padding:3px 9px;font-size:12.5px}
 button:disabled{opacity:.6;cursor:progress}
 form.inline{display:inline}
+.keybox{margin:8px 0 14px}
+.keybox summary{cursor:pointer;color:var(--accent);font-weight:600;font-size:13.5px}
+.key-row{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}
+.key-row input{flex:1 1 260px;min-width:0}
 .grid-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:4px 16px;align-items:end}
 .grid-form label.check{margin-bottom:20px}
 .notice{border-color:var(--accent)}

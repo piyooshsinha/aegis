@@ -57,6 +57,15 @@ pub struct KeyRow {
     pub allowed_models: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ProviderKeyRow {
+    pub provider: String,
+    pub nonce: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+    pub hint: String,
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Summary {
     pub requests: i64,
@@ -130,6 +139,13 @@ const SCHEMA: &[&str] = &[
         error TEXT NOT NULL
     )",
     "CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts)",
+    "CREATE TABLE IF NOT EXISTS provider_keys (
+        provider TEXT PRIMARY KEY,
+        nonce BLOB NOT NULL,
+        ciphertext BLOB NOT NULL,
+        hint TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+    )",
 ];
 
 impl Db {
@@ -212,6 +228,45 @@ impl Db {
             .execute(&self.pool)
             .await?;
         Ok(res.rows_affected() > 0)
+    }
+
+    // ---- provider keys (encrypted) ----------------------------------------
+
+    pub async fn set_provider_key(&self, provider: &str, nonce: &[u8], ciphertext: &[u8], hint: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO provider_keys (provider, nonce, ciphertext, hint, updated_at) VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(provider) DO UPDATE SET nonce = excluded.nonce, ciphertext = excluded.ciphertext,
+                hint = excluded.hint, updated_at = excluded.updated_at",
+        )
+        .bind(provider)
+        .bind(nonce)
+        .bind(ciphertext)
+        .bind(hint)
+        .bind(crate::types::now_ms())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_provider_key(&self, provider: &str) -> Result<()> {
+        sqlx::query("DELETE FROM provider_keys WHERE provider = ?").bind(provider).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn list_provider_keys(&self) -> Result<Vec<ProviderKeyRow>> {
+        let rows = sqlx::query("SELECT provider, nonce, ciphertext, hint, updated_at FROM provider_keys")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| ProviderKeyRow {
+                provider: r.get("provider"),
+                nonce: r.get("nonce"),
+                ciphertext: r.get("ciphertext"),
+                hint: r.get("hint"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect())
     }
 
     // ---- request log -----------------------------------------------------

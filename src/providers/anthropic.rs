@@ -137,7 +137,7 @@ fn body(model: &ModelCfg, req: &ChatRequest, stream: bool) -> Value {
 fn request(a: &Adapter, body: &Value) -> reqwest::RequestBuilder {
     a.client
         .post(format!("{}/v1/messages", a.base_url))
-        .header("x-api-key", a.api_key.as_deref().unwrap_or(""))
+        .header("x-api-key", a.api_key().unwrap_or_default())
         .header("anthropic-version", API_VERSION)
         .json(body)
 }
