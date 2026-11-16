@@ -85,7 +85,19 @@ impl AppState {
 
         let telemetry = db.spawn_writer(cfg.server.retention_days);
         let cache = ResponseCache::new(&cfg.cache);
+        // The semantic index is rebuilt from the database, so a restart or
+        // deploy does not throw away what it has learned.
         let semantic = SemanticIndex::new(&cfg.cache);
+        if cfg.cache.enabled && cfg.cache.semantic.enabled {
+            let mut restored = 0usize;
+            for (partition, vector, entry, expires_ms) in db.load_semantic(&cfg.cache.semantic.embedding_model).await? {
+                if let Ok(entry) = serde_json::from_str::<CachedEntry>(&entry) {
+                    semantic.restore(partition, vector, entry, expires_ms);
+                    restored += 1;
+                }
+            }
+            tracing::info!(restored, "semantic cache loaded");
+        }
         let webhook = std::env::var(&cfg.alerts.webhook_url_env).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
         let alerts = Alerts::new(&cfg.alerts, webhook);
         Ok(Arc::new(Self {
@@ -193,6 +205,25 @@ impl AppState {
         self.keys.add_spend(key_id, usd);
         if let Some(budget) = budget {
             self.alerts.on_spend(id, key_name, budget, before, before + usd);
+        }
+    }
+
+    /// File an answer in the semantic index and save it for the next start.
+    async fn semantic_store(&self, partition: String, vector: Vec<f32>, entry: CachedEntry) {
+        let json = serde_json::to_string(&entry).unwrap_or_default();
+        let Some((unit, expires_ms)) = self.semantic.insert(partition.clone(), vector, entry) else { return };
+        let cfg = self.semantic.cfg();
+        if let Err(e) = self.db.insert_semantic(&cfg.embedding_model, &partition, &unit, &json, expires_ms, cfg.max_entries).await {
+            tracing::warn!("semantic cache entry not saved: {e}");
+        }
+    }
+
+    /// Empty both cache layers, in memory and on disk.
+    pub async fn purge_caches(&self) {
+        self.cache.purge().await;
+        self.semantic.purge();
+        if let Err(e) = self.db.purge_semantic().await {
+            tracing::warn!("semantic cache not purged from the database: {e}");
         }
     }
 
@@ -603,7 +634,7 @@ pub async fn run_chat(state: Shared, ident: Arc<Identity>, opts: ChatOpts, req: 
                             stored_at: now_ms(),
                         };
                         if let Some((partition, vector)) = sem {
-                            state.semantic.insert(partition, vector, entry.clone());
+                            state.semantic_store(partition, vector, entry.clone()).await;
                         }
                         state.cache.put(key, entry).await;
                     }
@@ -1115,7 +1146,7 @@ fn proxy_stream(
         yield Ok(Event::default().data("[DONE]"));
         if let Some((key, entry)) = fin.settle() {
             if let Some((partition, vector)) = fin.sem.take() {
-                fin.state.semantic.insert(partition, vector, entry.clone());
+                fin.state.semantic_store(partition, vector, entry.clone()).await;
             }
             fin.state.cache.put(key, entry).await;
         }

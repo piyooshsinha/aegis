@@ -788,3 +788,53 @@ async fn provider_test_button_reports_working_and_broken_providers() {
     // A failed test does not trip the circuit breaker.
     assert_eq!(h.state.quota.view("down/m").failures, 0);
 }
+
+#[tokio::test]
+async fn semantic_cache_survives_a_restart_until_purged() {
+    let h = harness_with(SEMANTIC).await;
+    let ask = |text: &str| {
+        let mut m = msg("good/m", text);
+        m["temperature"] = json!(0);
+        m
+    };
+    let restart = || async {
+        let state = AppState::build(h.state.cfg.clone(), "admin-secret".into(), None).await.unwrap();
+        state.keys.reload(&state.db).await.unwrap();
+        let base = spawn(aegis::router(state.clone())).await;
+        (state, base)
+    };
+    let chat = |base: String, body: Value| {
+        let (http, key) = (h.http.clone(), h.key.clone());
+        async move { http.post(format!("{base}/v1/chat/completions")).bearer_auth(key).json(&body).send().await.unwrap() }
+    };
+
+    assert_eq!(hdr(&h.chat(&h.key, ask("What is the capital of France?")).await, "x-aegis-cache"), "miss");
+    assert_eq!(h.mock.good_calls.load(Ordering::SeqCst), 1);
+
+    // A second gateway on the same database stands in for a restart.
+    let (state2, base2) = restart().await;
+    assert_eq!(state2.semantic.stats().entries, 1);
+    let r = chat(base2.clone(), ask("what is the capital of france")).await;
+    assert_eq!(hdr(&r, "x-aegis-cache"), "semantic");
+    assert_eq!(r.json::<Value>().await.unwrap()["choices"][0]["message"]["content"], "Hello");
+    assert_eq!(h.mock.good_calls.load(Ordering::SeqCst), 1);
+
+    // A purge empties the saved copy too, so nothing comes back afterwards.
+    state2.purge_caches().await;
+    let (state3, base3) = restart().await;
+    assert_eq!(state3.semantic.stats().entries, 0);
+    assert_eq!(hdr(&chat(base3, ask("what is the capital of france")).await, "x-aegis-cache"), "miss");
+
+    // Entries made with another embedding model, and expired ones, are not loaded.
+    let db = &h.state.db;
+    db.insert_semantic("some/other-model", "p", &[1.0, 0.0], "{}", i64::MAX, 100).await.unwrap();
+    assert!(db.load_semantic("embed/emb").await.unwrap().iter().all(|r| r.0 != "p"));
+    db.insert_semantic("embed/emb", "old", &[1.0, 0.0], "{}", 1, 100).await.unwrap();
+    assert!(db.load_semantic("embed/emb").await.unwrap().iter().all(|r| r.0 != "old"));
+    // The table is capped at the newest `max` rows.
+    for i in 0..5 {
+        db.insert_semantic("embed/emb", &format!("p{i}"), &[1.0, 0.0], "{}", i64::MAX, 3).await.unwrap();
+    }
+    let kept: Vec<String> = db.load_semantic("embed/emb").await.unwrap().into_iter().map(|r| r.0).collect();
+    assert_eq!(kept, ["p2", "p3", "p4"]);
+}

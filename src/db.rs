@@ -139,6 +139,14 @@ const SCHEMA: &[&str] = &[
         error TEXT NOT NULL
     )",
     "CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts)",
+    "CREATE TABLE IF NOT EXISTS semantic_cache (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        embedding_model TEXT NOT NULL,
+        partition TEXT NOT NULL,
+        vector BLOB NOT NULL,
+        entry TEXT NOT NULL,
+        expires_ms INTEGER NOT NULL
+    )",
     "CREATE TABLE IF NOT EXISTS provider_keys (
         provider TEXT PRIMARY KEY,
         nonce BLOB NOT NULL,
@@ -267,6 +275,55 @@ impl Db {
                 updated_at: r.get("updated_at"),
             })
             .collect())
+    }
+
+    // ---- semantic cache ----------------------------------------------------
+
+    /// Save one semantic-cache entry and trim the table: expired rows, rows
+    /// made with another embedding model, and anything beyond the newest `max`.
+    pub async fn insert_semantic(&self, embedding_model: &str, partition: &str, vector: &[f32], entry_json: &str, expires_ms: i64, max: usize) -> Result<()> {
+        let bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
+        sqlx::query("INSERT INTO semantic_cache (embedding_model, partition, vector, entry, expires_ms) VALUES (?, ?, ?, ?, ?)")
+            .bind(embedding_model)
+            .bind(partition)
+            .bind(bytes)
+            .bind(entry_json)
+            .bind(expires_ms)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM semantic_cache WHERE expires_ms <= ? OR embedding_model != ?")
+            .bind(crate::types::now_ms())
+            .bind(embedding_model)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM semantic_cache WHERE id <= (SELECT id FROM semantic_cache ORDER BY id DESC LIMIT 1 OFFSET ?)")
+            .bind(max.max(1) as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Live entries made with this embedding model, oldest first:
+    /// (partition, vector, entry JSON, expiry).
+    pub async fn load_semantic(&self, embedding_model: &str) -> Result<Vec<(String, Vec<f32>, String, i64)>> {
+        let rows = sqlx::query("SELECT partition, vector, entry, expires_ms FROM semantic_cache WHERE embedding_model = ? AND expires_ms > ? ORDER BY id")
+            .bind(embedding_model)
+            .bind(crate::types::now_ms())
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let bytes: Vec<u8> = r.get("vector");
+                let vector = bytes.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
+                (r.get("partition"), vector, r.get("entry"), r.get("expires_ms"))
+            })
+            .collect())
+    }
+
+    pub async fn purge_semantic(&self) -> Result<()> {
+        sqlx::query("DELETE FROM semantic_cache").execute(&self.pool).await?;
+        Ok(())
     }
 
     // ---- request log -----------------------------------------------------

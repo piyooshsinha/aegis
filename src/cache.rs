@@ -41,7 +41,7 @@ impl CacheMode {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CachedEntry {
     pub body: Value,
     pub provider: String,
@@ -242,11 +242,26 @@ impl SemanticIndex {
         best
     }
 
-    pub fn insert(&self, partition: String, vector: Vec<f32>, entry: CachedEntry) {
-        let Some(vector) = normalize(vector) else { return };
+    /// File an answer. Returns the unit-length vector and expiry time that
+    /// were stored, so the caller can persist the same entry.
+    pub fn insert(&self, partition: String, vector: Vec<f32>, entry: CachedEntry) -> Option<(Vec<f32>, i64)> {
+        let vector = normalize(vector)?;
+        let expires_ms = now_ms() + self.ttl_ms;
         self.stores.fetch_add(1, Ordering::Relaxed);
+        self.push(partition, vector.clone(), entry, expires_ms);
+        Some((vector, expires_ms))
+    }
+
+    /// Put back an entry saved by an earlier run. Expired ones are dropped.
+    pub fn restore(&self, partition: String, vector: Vec<f32>, entry: CachedEntry, expires_ms: i64) {
+        if expires_ms > now_ms() && !vector.is_empty() {
+            self.push(partition, vector, entry, expires_ms);
+        }
+    }
+
+    fn push(&self, partition: String, vector: Vec<f32>, entry: CachedEntry, expires_ms: i64) {
         let mut g = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        g.push_back(SemEntry { partition, vector, entry: Arc::new(entry), expires_ms: now_ms() + self.ttl_ms });
+        g.push_back(SemEntry { partition, vector, entry: Arc::new(entry), expires_ms });
         while g.len() > self.cfg.max_entries.max(1) {
             g.pop_front();
         }

@@ -85,7 +85,8 @@ down the request goes upstream as usual.
 A similarity score is not a guarantee. "What is 2+3?" and "What is 2+4?" are
 close in most embedding models, so keep the threshold high for anything where
 a near-match answer would be wrong, or send `x-aegis-cache: exact`. The index
-is in memory, is scanned linearly, and is emptied by a restart or a purge.
+is scanned linearly in memory and saved to SQLite, so it survives a restart;
+a purge empties both. Changing `embedding_model` discards the saved entries.
 
 ### Alerts
 

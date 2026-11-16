@@ -824,8 +824,7 @@ async fn cache(State(state): State<Shared>, headers: HeaderMap) -> Response {
 
 async fn purge_cache(State(state): State<Shared>, headers: HeaderMap) -> Response {
     require_admin!(state, headers);
-    state.cache.purge().await;
-    state.semantic.purge();
+    state.purge_caches().await;
     Redirect::to("/ui/cache").into_response()
 }
 
