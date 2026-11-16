@@ -63,7 +63,9 @@ pub struct CacheStats {
 
 pub struct ResponseCache {
     cfg: CacheCfg,
-    inner: Cache<String, Arc<CachedEntry>>,
+    /// Entry and the time it expires. The cache's own lifetime is an upper
+    /// bound; entries restored after a restart keep their original expiry.
+    inner: Cache<String, (Arc<CachedEntry>, i64)>,
     hits: AtomicU64,
     misses: AtomicU64,
     stores: AtomicU64,
@@ -121,7 +123,14 @@ impl ResponseCache {
     }
 
     pub async fn get(&self, key: &str) -> Option<Arc<CachedEntry>> {
-        let hit = self.inner.get(key).await;
+        let hit = match self.inner.get(key).await {
+            Some((entry, expires_ms)) if expires_ms > now_ms() => Some(entry),
+            Some(_) => {
+                self.inner.invalidate(key).await;
+                None
+            }
+            None => None,
+        };
         if hit.is_some() {
             self.hits.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -130,9 +139,19 @@ impl ResponseCache {
         hit
     }
 
-    pub async fn put(&self, key: String, entry: CachedEntry) {
+    /// Store an answer. Returns when it expires, for persisting.
+    pub async fn put(&self, key: String, entry: CachedEntry) -> i64 {
+        let expires_ms = now_ms() + (self.cfg.ttl_secs.max(1) as i64) * 1000;
         self.stores.fetch_add(1, Ordering::Relaxed);
-        self.inner.insert(key, Arc::new(entry)).await;
+        self.inner.insert(key, (Arc::new(entry), expires_ms)).await;
+        expires_ms
+    }
+
+    /// Put back an entry saved by an earlier run. Expired ones are dropped.
+    pub async fn restore(&self, key: String, entry: CachedEntry, expires_ms: i64) {
+        if self.cfg.enabled && expires_ms > now_ms() {
+            self.inner.insert(key, (Arc::new(entry), expires_ms)).await;
+        }
     }
 
     pub async fn purge(&self) {

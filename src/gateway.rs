@@ -85,8 +85,18 @@ impl AppState {
 
         let telemetry = db.spawn_writer(cfg.server.retention_days);
         let cache = ResponseCache::new(&cfg.cache);
-        // The semantic index is rebuilt from the database, so a restart or
+        // Both cache layers are rebuilt from the database, so a restart or
         // deploy does not throw away what it has learned.
+        if cfg.cache.enabled {
+            let mut restored = 0usize;
+            for (key, entry, expires_ms) in db.load_cached().await? {
+                if let Ok(entry) = serde_json::from_str::<CachedEntry>(&entry) {
+                    cache.restore(key, entry, expires_ms).await;
+                    restored += 1;
+                }
+            }
+            tracing::info!(restored, "response cache loaded");
+        }
         let semantic = SemanticIndex::new(&cfg.cache);
         if cfg.cache.enabled && cfg.cache.semantic.enabled {
             let mut restored = 0usize;
@@ -100,7 +110,7 @@ impl AppState {
         }
         let webhook = std::env::var(&cfg.alerts.webhook_url_env).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
         let alerts = Alerts::new(&cfg.alerts, webhook);
-        Ok(Arc::new(Self {
+        let state = Arc::new(Self {
             cfg,
             adapters,
             quota,
@@ -115,7 +125,53 @@ impl AppState {
             stored_keys: Mutex::new(stored_keys),
             sessions: Mutex::new(HashSet::new()),
             started: Instant::now(),
-        }))
+        });
+
+        // A cold embedding model can take longer to load than a lookup is
+        // allowed to wait, so load it now rather than on the first request.
+        if state.cfg.cache.enabled && state.cfg.cache.semantic.enabled {
+            let warm = state.clone();
+            tokio::spawn(async move {
+                warm.warm_embedding_model().await;
+                let every = warm.cfg.cache.semantic.keep_warm_secs;
+                if every > 0 {
+                    let mut tick = tokio::time::interval(Duration::from_secs(every.max(10)));
+                    tick.tick().await;
+                    loop {
+                        tick.tick().await;
+                        warm.warm_embedding_model().await;
+                    }
+                }
+            });
+        }
+        Ok(state)
+    }
+
+    /// One throwaway embedding, with a generous timeout, to get the model
+    /// loaded. Returns whether it answered.
+    pub async fn warm_embedding_model(&self) -> bool {
+        let Some(t) = self.target(&self.semantic.cfg().embedding_model) else { return false };
+        let (p, m) = self.parts(&t);
+        let Some(adapter) = self.adapters.get(&p.name) else { return false };
+        if !p.api_key_env.is_empty() && adapter.api_key().is_none() {
+            return false;
+        }
+        let inputs = ["warm up".to_string()];
+        let started = Instant::now();
+        match tokio::time::timeout(Duration::from_secs(120), adapter.embed(m, &inputs, None)).await {
+            Ok(Ok(_)) => {
+                tracing::debug!(target = %t.key, ms = started.elapsed().as_millis() as u64, "embedding model is warm");
+                true
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(target = %t.key, "semantic cache: embedding model is not ready: {e}");
+                false
+            }
+            Err(_) => {
+                tracing::warn!(target = %t.key, "semantic cache: embedding model did not answer within 120s");
+                false
+            }
+        }
     }
 
     pub fn target(&self, key: &str) -> Option<Target> {
@@ -208,6 +264,15 @@ impl AppState {
         }
     }
 
+    /// Cache an answer under its exact key and save it for the next start.
+    async fn cache_store(&self, key: String, entry: CachedEntry) {
+        let json = serde_json::to_string(&entry).unwrap_or_default();
+        let expires_ms = self.cache.put(key.clone(), entry).await;
+        if let Err(e) = self.db.insert_cached(&key, &json, expires_ms, self.cache.cfg().max_entries).await {
+            tracing::warn!("cached response not saved: {e}");
+        }
+    }
+
     /// File an answer in the semantic index and save it for the next start.
     async fn semantic_store(&self, partition: String, vector: Vec<f32>, entry: CachedEntry) {
         let json = serde_json::to_string(&entry).unwrap_or_default();
@@ -222,6 +287,9 @@ impl AppState {
     pub async fn purge_caches(&self) {
         self.cache.purge().await;
         self.semantic.purge();
+        if let Err(e) = self.db.purge_cached().await {
+            tracing::warn!("response cache not purged from the database: {e}");
+        }
         if let Err(e) = self.db.purge_semantic().await {
             tracing::warn!("semantic cache not purged from the database: {e}");
         }
@@ -636,7 +704,7 @@ pub async fn run_chat(state: Shared, ident: Arc<Identity>, opts: ChatOpts, req: 
                         if let Some((partition, vector)) = sem {
                             state.semantic_store(partition, vector, entry.clone()).await;
                         }
-                        state.cache.put(key, entry).await;
+                        state.cache_store(key, entry).await;
                     }
                     rec.status = "ok".into();
                     rec.http_status = 200;
@@ -1148,7 +1216,7 @@ fn proxy_stream(
             if let Some((partition, vector)) = fin.sem.take() {
                 fin.state.semantic_store(partition, vector, entry.clone()).await;
             }
-            fin.state.cache.put(key, entry).await;
+            fin.state.cache_store(key, entry).await;
         }
     };
     Sse::new(s).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))

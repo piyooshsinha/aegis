@@ -37,6 +37,9 @@ threshold = 0.95      # minimum cosine similarity; lower matches more loosely
 max_entries = 2000
 min_chars = 16        # shorter messages are matched exactly only
 timeout_ms = 3000     # give up on the embedding call and go upstream
+# The model is warmed once at startup. Set this above 0 to also ping it this
+# often, for servers that unload an idle model (Ollama: after 5 minutes).
+keep_warm_secs = 0
 
 # Alerts are always listed on the dashboard's Alerts page. To also receive
 # them, put a webhook URL (Slack, Discord or anything that accepts a JSON

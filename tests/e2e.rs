@@ -838,3 +838,51 @@ async fn semantic_cache_survives_a_restart_until_purged() {
     let kept: Vec<String> = db.load_semantic("embed/emb").await.unwrap().into_iter().map(|r| r.0).collect();
     assert_eq!(kept, ["p2", "p3", "p4"]);
 }
+
+#[tokio::test]
+async fn exact_cache_survives_a_restart_and_embedding_model_is_warmed() {
+    let h = harness_with(SEMANTIC).await;
+    // Startup sends one warm-up embedding before any request arrives.
+    for _ in 0..50 {
+        if h.mock.embed_calls.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(h.mock.embed_calls.load(Ordering::SeqCst), 1);
+    assert!(h.state.warm_embedding_model().await);
+
+    // "Hi" is too short for the semantic layer, so only the exact cache can serve it.
+    let mut m = msg("good/m", "Hi");
+    m["temperature"] = json!(0);
+    assert_eq!(hdr(&h.chat(&h.key, m.clone()).await, "x-aegis-cache"), "miss");
+    let mut s = m.clone();
+    s["stream"] = json!(true);
+    s["messages"][0]["content"] = json!("Yo");
+    h.chat(&h.key, s.clone()).await.text().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let restart = || async {
+        let state = AppState::build(h.state.cfg.clone(), "admin-secret".into(), None).await.unwrap();
+        state.keys.reload(&state.db).await.unwrap();
+        let base = spawn(aegis::router(state.clone())).await;
+        (state, base)
+    };
+    let (state2, base2) = restart().await;
+    let before = h.mock.good_calls.load(Ordering::SeqCst);
+    for body in [&m, &s] {
+        let r = h.http.post(format!("{base2}/v1/chat/completions")).bearer_auth(&h.key).json(body).send().await.unwrap();
+        assert_eq!(hdr(&r, "x-aegis-cache"), "hit");
+        assert!(r.text().await.unwrap().contains("Hel"));
+    }
+    assert_eq!(h.mock.good_calls.load(Ordering::SeqCst), before);
+
+    // Purging removes the saved copy; an expired row is never loaded.
+    state2.purge_caches().await;
+    assert!(h.state.db.load_cached().await.unwrap().is_empty());
+    h.state.db.insert_cached("stale", "{}", 1, 10).await.unwrap();
+    assert!(h.state.db.load_cached().await.unwrap().is_empty());
+    let (_, base3) = restart().await;
+    let r = h.http.post(format!("{base3}/v1/chat/completions")).bearer_auth(&h.key).json(&m).send().await.unwrap();
+    assert_eq!(hdr(&r, "x-aegis-cache"), "miss");
+}

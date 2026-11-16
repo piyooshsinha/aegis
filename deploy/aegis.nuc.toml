@@ -32,11 +32,14 @@ scope = "per_key"   # or "global" to share entries between client keys
 # can opt out per request with `x-aegis-cache: exact`.
 [cache.semantic]
 enabled = true
-embedding_model = "ollama/nomic-embed-text"   # needs the "embeddings" capability
+embedding_model = "ollama-nuc/nomic-embed-text"   # needs the "embeddings" capability
 threshold = 0.95      # minimum cosine similarity; lower matches more loosely
 max_entries = 2000
 min_chars = 16        # shorter messages are matched exactly only
 timeout_ms = 3000     # give up on the embedding call and go upstream
+# The model is warmed once at startup. Set this above 0 to also ping it this
+# often, for servers that unload an idle model (Ollama: after 5 minutes).
+keep_warm_secs = 0
 
 # Alerts are always listed on the dashboard's Alerts page. To also receive
 # them, put a webhook URL (Slack, Discord or anything that accepts a JSON
@@ -67,6 +70,21 @@ timeout_secs = 300
   capabilities = ["json"]
 
   # Embedding model: `ollama pull nomic-embed-text` before using it.
+  [[providers.models]]
+  id = "nomic-embed-text"
+  context_window = 8192
+  capabilities = ["embeddings"]
+
+# Ollama running on the NUC itself (the aegis-ollama container in
+# compose.yml). It serves the embedding model, so embeddings and semantic
+# caching do not depend on the Mac being awake.
+[[providers]]
+name = "ollama-nuc"
+kind = "openai"
+base_url = "http://127.0.0.1:11437/v1"
+tier = "local"
+timeout_secs = 60
+
   [[providers.models]]
   id = "nomic-embed-text"
   context_window = 8192
@@ -187,4 +205,4 @@ targets = ["gemini/gemini-2.5-flash", "anthropic/claude-haiku-5-5", "openai/gpt-
 [[routes]]
 alias = "embed-model"
 description = "Text embeddings"
-targets = ["ollama/nomic-embed-text"]
+targets = ["ollama-nuc/nomic-embed-text", "ollama/nomic-embed-text"]

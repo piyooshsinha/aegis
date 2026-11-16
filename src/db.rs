@@ -139,6 +139,12 @@ const SCHEMA: &[&str] = &[
         error TEXT NOT NULL
     )",
     "CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts)",
+    "CREATE TABLE IF NOT EXISTS response_cache (
+        key TEXT PRIMARY KEY,
+        entry TEXT NOT NULL,
+        expires_ms INTEGER NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_response_cache_expires ON response_cache(expires_ms)",
     "CREATE TABLE IF NOT EXISTS semantic_cache (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         embedding_model TEXT NOT NULL,
@@ -275,6 +281,39 @@ impl Db {
                 updated_at: r.get("updated_at"),
             })
             .collect())
+    }
+
+    // ---- exact-match cache -------------------------------------------------
+
+    /// Save one cached response and trim the table: expired rows, and
+    /// anything beyond the newest `max`.
+    pub async fn insert_cached(&self, key: &str, entry_json: &str, expires_ms: i64, max: u64) -> Result<()> {
+        sqlx::query("INSERT OR REPLACE INTO response_cache (key, entry, expires_ms) VALUES (?, ?, ?)")
+            .bind(key)
+            .bind(entry_json)
+            .bind(expires_ms)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM response_cache WHERE expires_ms <= ?").bind(crate::types::now_ms()).execute(&self.pool).await?;
+        sqlx::query("DELETE FROM response_cache WHERE rowid <= (SELECT rowid FROM response_cache ORDER BY rowid DESC LIMIT 1 OFFSET ?)")
+            .bind(max.max(1) as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Live cached responses, oldest first: (key, entry JSON, expiry).
+    pub async fn load_cached(&self) -> Result<Vec<(String, String, i64)>> {
+        let rows = sqlx::query("SELECT key, entry, expires_ms FROM response_cache WHERE expires_ms > ? ORDER BY rowid")
+            .bind(crate::types::now_ms())
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|r| (r.get("key"), r.get("entry"), r.get("expires_ms"))).collect())
+    }
+
+    pub async fn purge_cached(&self) -> Result<()> {
+        sqlx::query("DELETE FROM response_cache").execute(&self.pool).await?;
+        Ok(())
     }
 
     // ---- semantic cache ----------------------------------------------------

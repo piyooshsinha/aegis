@@ -87,6 +87,8 @@ close in most embedding models, so keep the threshold high for anything where
 a near-match answer would be wrong, or send `x-aegis-cache: exact`. The index
 is scanned linearly in memory and saved to SQLite, so it survives a restart;
 a purge empties both. Changing `embedding_model` discards the saved entries.
+The embedding model is warmed once at startup; `keep_warm_secs` pings it
+periodically for servers that unload idle models.
 
 ### Alerts
 
@@ -103,8 +105,8 @@ URL to also receive each one as a JSON POST; the payload has `text` and
   falls back; after that the error is reported in-band.
 - **Caching and non-determinism.** Only requests with `temperature` at or below
   `cache.max_temperature` (default 0), or with a `seed`, are cached. Entries
-  expire after `ttl_secs`, can be purged, and are partitioned per client key by
-  default. Streamed answers are cached once complete and replayed as a stream.
+  expire after `ttl_secs`, can be purged, are partitioned per client key by
+  default, and are saved to SQLite so a restart does not empty the cache. Streamed answers are cached once complete and replayed as a stream.
 - **Quota tracking** combines local sliding-window counters (requests and
   tokens per minute and per day, against the limits in config) with what
   providers report: `429` + `retry-after` starts a cooldown, and
@@ -142,7 +144,9 @@ each provider's current documentation.
 ## Deploy
 
 [deploy/compose.yml](deploy/compose.yml) builds the image and runs it with host
-networking. The NUC config ([deploy/aegis.nuc.toml](deploy/aegis.nuc.toml)) binds port 9001. Secrets go in `deploy/.env` (see `.env.example`).
+networking. The NUC config ([deploy/aegis.nuc.toml](deploy/aegis.nuc.toml)) binds port 9001. Secrets go in `deploy/.env` (see `.env.example`). The compose file also runs a small
+Ollama container for the embedding model; fetch the model once with
+`docker exec aegis-ollama ollama pull nomic-embed-text`.
 
 ```bash
 docker compose -f deploy/compose.yml up -d --build

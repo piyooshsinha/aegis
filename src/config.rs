@@ -98,11 +98,16 @@ pub struct SemanticCfg {
     pub min_chars: usize,
     /// Give up on the embedding call after this long and go upstream.
     pub timeout_ms: u64,
+    /// The embedding model is always warmed once at startup. If this is
+    /// above zero it is also pinged this often, for servers that unload an
+    /// idle model (Ollama does after 5 minutes by default). Leave at 0 for
+    /// paid embedding providers.
+    pub keep_warm_secs: u64,
 }
 
 impl Default for SemanticCfg {
     fn default() -> Self {
-        Self { enabled: false, embedding_model: String::new(), threshold: 0.95, max_entries: 2000, min_chars: 16, timeout_ms: 3000 }
+        Self { enabled: false, embedding_model: String::new(), threshold: 0.95, max_entries: 2000, min_chars: 16, timeout_ms: 3000, keep_warm_secs: 0 }
     }
 }
 

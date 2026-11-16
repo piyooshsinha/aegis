@@ -1,5 +1,5 @@
-# Aegis on the NUC. Host networking lets the gateway reach the Ollama
-# listener on 127.0.0.1:11435. The port is set by `bind` in aegis.nuc.toml;
+# Aegis on the NUC. Host networking lets the gateway reach the relay to the
+# Mac's Ollama on 127.0.0.1:11435 and its own Ollama on 127.0.0.1:11437. The port is set by `bind` in aegis.nuc.toml;
 # keep the healthcheck below in step with it.
 services:
   aegis:
@@ -18,5 +18,19 @@ services:
       - ./aegis.nuc.toml:/app/aegis.toml:ro
       - aegis-data:/app/data
 
+  # Serves the embedding model locally. After the first start, fetch it once:
+  #   docker exec aegis-ollama ollama pull nomic-embed-text
+  aegis-ollama:
+    image: ollama/ollama:latest
+    container_name: aegis-ollama
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:11437:11434"
+    environment:
+      OLLAMA_KEEP_ALIVE: "-1"   # keep the model loaded instead of unloading after 5 minutes
+    volumes:
+      - aegis-ollama:/root/.ollama
+
 volumes:
   aegis-data:
+  aegis-ollama:
