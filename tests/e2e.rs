@@ -18,6 +18,34 @@ use std::time::Duration;
 struct Mock {
     good_calls: AtomicUsize,
     limited_calls: AtomicUsize,
+    embed_calls: AtomicUsize,
+}
+
+/// A toy embedding: a bag of lower-cased words hashed into 32 buckets. Texts
+/// with the same words (any case or punctuation) get the same vector.
+fn toy_embedding(text: &str) -> Vec<f32> {
+    let mut v = vec![0f32; 32];
+    for word in text.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()) {
+        let bucket = word.bytes().fold(7usize, |h, b| h.wrapping_mul(31).wrapping_add(b as usize)) % 32;
+        v[bucket] += 1.0;
+    }
+    v
+}
+
+async fn upstream_embeddings(State(m): State<Arc<Mock>>, Path(kind): Path<String>, Json(body): Json<Value>) -> Response {
+    if kind == "down" {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response();
+    }
+    m.embed_calls.fetch_add(1, Ordering::SeqCst);
+    let inputs = body["input"].as_array().cloned().unwrap_or_default();
+    // Returned out of order on purpose: clients must sort by `index`.
+    let data: Vec<Value> = inputs
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(i, t)| json!({ "object": "embedding", "index": i, "embedding": toy_embedding(t.as_str().unwrap_or("")) }))
+        .collect();
+    Json(json!({ "object": "list", "model": body["model"], "data": data, "usage": { "prompt_tokens": 5 * inputs.len(), "total_tokens": 5 * inputs.len() } })).into_response()
 }
 
 async fn upstream(State(m): State<Arc<Mock>>, Path(kind): Path<String>, Json(body): Json<Value>) -> Response {
@@ -90,8 +118,19 @@ async fn spawn(app: Router) -> String {
 }
 
 async fn harness() -> Harness {
+    harness_with("").await
+}
+
+/// `extra` is appended to the config, for tests that turn on optional features.
+async fn harness_with(extra: &str) -> Harness {
     let mock = Arc::new(Mock::default());
-    let up = spawn(Router::new().route("/{kind}/chat/completions", post(upstream)).with_state(mock.clone())).await;
+    let up = spawn(
+        Router::new()
+            .route("/{kind}/chat/completions", post(upstream))
+            .route("/{kind}/embeddings", post(upstream_embeddings))
+            .with_state(mock.clone()),
+    )
+    .await;
     let db = std::env::temp_dir().join(format!("aegis-test-{}.db", uuid::Uuid::new_v4().simple()));
     let cfg = Config::parse(&format!(
         r#"
@@ -155,6 +194,31 @@ api_key_env = "AEGIS_TEST_UNSET_KEY_VAR"
 tier = "free"
 models = [{{ id = "m" }}]
 
+[[providers]]
+name = "embdown"
+kind = "openai"
+base_url = "{up}/down"
+tier = "local"
+models = [{{ id = "emb", capabilities = ["embeddings"] }}]
+
+[[providers]]
+name = "embother"
+kind = "openai"
+base_url = "{up}/good"
+tier = "local"
+models = [{{ id = "other-emb", capabilities = ["embeddings"] }}]
+
+[[providers]]
+name = "embed"
+kind = "openai"
+base_url = "{up}/good"
+tier = "local"
+models = [{{ id = "emb", context_window = 50, capabilities = ["embeddings"], input_per_mtok = 2.0 }}]
+
+[[routes]]
+alias = "embed"
+targets = ["embdown/emb", "embother/other-emb", "embed/emb"]
+
 [[routes]]
 alias = "fast"
 targets = ["limited/m", "down/m", "good/m"]
@@ -174,6 +238,8 @@ targets = ["bad/m", "good/m"]
 [[routes]]
 alias = "stream-recover"
 targets = ["midfail/m", "good/m"]
+
+{extra}
 "#,
         db = db.display(),
     ))
@@ -474,4 +540,251 @@ async fn provider_key_set_from_dashboard_is_encrypted_and_used_at_once() {
     assert_eq!(r.status(), 303);
     assert_eq!(h.chat(&h.key, msg("nokey/m", "hi")).await.status(), 503);
     assert!(h.state.db.list_provider_keys().await.unwrap().is_empty());
+}
+
+impl Harness {
+    async fn post(&self, path: &str, key: &str, headers: &[(&str, &str)], body: &Value) -> reqwest::Response {
+        let mut rb = self.http.post(format!("{}{path}", self.base)).bearer_auth(key).json(body);
+        for (k, v) in headers {
+            rb = rb.header(*k, *v);
+        }
+        rb.send().await.unwrap()
+    }
+}
+
+#[tokio::test]
+async fn embeddings_fall_back_only_to_the_same_model() {
+    let h = harness().await;
+    let body = json!({ "model": "embed", "input": ["first text", "second text"] });
+    let r = h.post("/v1/embeddings", &h.key, &[], &body).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(hdr(&r, "x-aegis-provider"), "embed");
+    assert_eq!(hdr(&r, "x-aegis-fallback"), "true");
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["model"], "emb");
+    assert_eq!(v["usage"]["prompt_tokens"], 10);
+    // Order follows the input even though the provider answered out of order.
+    let want: Vec<f64> = toy_embedding("second text").iter().map(|f| *f as f64).collect();
+    let got: Vec<f64> = v["data"][1]["embedding"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
+    assert_eq!(v["data"][1]["index"], 1);
+    assert_eq!(got, want);
+
+    // The log shows the dead provider and the skipped different model.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let rows = h.state.db.recent_requests(10).await.unwrap();
+    let attempts: Value = serde_json::from_str(&rows[0].attempts).unwrap();
+    assert_eq!(attempts[0]["outcome"], "failed");
+    assert!(attempts[1]["reason"].as_str().unwrap().contains("different embedding model"));
+    assert_eq!(attempts[2]["outcome"], "served");
+    assert!(rows[0].cost_usd > 0.0);
+
+    // base64 output, as the OpenAI Python SDK asks for by default.
+    let r = h.post("/v1/embeddings", &h.key, &[], &json!({ "model": "embed/emb", "input": "first text", "encoding_format": "base64" })).await;
+    let v: Value = r.json().await.unwrap();
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(v["data"][0]["embedding"].as_str().unwrap()).unwrap();
+    let decoded: Vec<f32> = bytes.chunks(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    assert_eq!(decoded, toy_embedding("first text"));
+
+    // Bad input, a chat model, an oversized input, and no key.
+    let r = h.post("/v1/embeddings", &h.key, &[], &json!({ "model": "embed", "input": [[1, 2, 3]] })).await;
+    assert_eq!(r.status(), 400);
+    let r = h.post("/v1/embeddings", &h.key, &[], &json!({ "model": "good/m", "input": "hi" })).await;
+    assert_eq!(r.status(), 503);
+    assert!(r.text().await.unwrap().contains("not an embedding model"));
+    let r = h.post("/v1/embeddings", &h.key, &[], &json!({ "model": "embed/emb", "input": "x".repeat(400) })).await;
+    assert_eq!(r.status(), 503);
+    let r = h.http.post(format!("{}/v1/embeddings", h.base)).json(&body).send().await.unwrap();
+    assert_eq!(r.status(), 401);
+
+    // And an embedding model never answers chat.
+    let r = h.chat(&h.key, msg("embed/emb", "hi")).await;
+    assert_eq!(r.status(), 503);
+    assert!(r.text().await.unwrap().contains("embedding model cannot serve chat"));
+}
+
+const SEMANTIC: &str = r#"
+[cache.semantic]
+enabled = true
+embedding_model = "embed/emb"
+threshold = 0.95
+min_chars = 10
+"#;
+
+#[tokio::test]
+async fn semantic_cache_matches_rewordings_but_not_other_questions() {
+    let h = harness_with(SEMANTIC).await;
+    let ask = |text: &str| {
+        let mut m = msg("good/m", text);
+        m["temperature"] = json!(0);
+        m
+    };
+
+    let r = h.chat(&h.key, ask("What is the capital of France?")).await;
+    assert_eq!(hdr(&r, "x-aegis-cache"), "miss");
+    assert_eq!(h.mock.good_calls.load(Ordering::SeqCst), 1);
+
+    // Same words, different case and punctuation: served without an upstream call.
+    let r = h.chat(&h.key, ask("what is the capital of france")).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(hdr(&r, "x-aegis-cache"), "semantic");
+    assert!(hdr(&r, "x-aegis-cache-similarity").parse::<f64>().unwrap() >= 0.95);
+    assert_eq!(r.json::<Value>().await.unwrap()["choices"][0]["message"]["content"], "Hello");
+    assert_eq!(h.mock.good_calls.load(Ordering::SeqCst), 1);
+
+    // Streaming clients get the stored answer replayed.
+    let mut s = ask("WHAT IS THE CAPITAL OF FRANCE");
+    s["stream"] = json!(true);
+    let r = h.chat(&h.key, s).await;
+    assert_eq!(hdr(&r, "x-aegis-cache"), "semantic");
+    assert!(r.text().await.unwrap().contains("\"content\":\"Hello\""));
+
+    // A different question goes upstream.
+    let r = h.chat(&h.key, ask("How do I bake sourdough bread at home?")).await;
+    assert_eq!(hdr(&r, "x-aegis-cache"), "miss");
+    assert_eq!(h.mock.good_calls.load(Ordering::SeqCst), 2);
+
+    // Same question under a different system prompt is a different conversation.
+    let mut sys = ask("what is the capital of france");
+    sys["messages"] = json!([{ "role": "system", "content": "Answer in French." }, { "role": "user", "content": "what is the capital of france" }]);
+    assert_eq!(hdr(&h.chat(&h.key, sys).await, "x-aegis-cache"), "miss");
+
+    // Another client key, the exact-only header, and sampled requests never match.
+    assert_eq!(hdr(&h.chat(&h.free_key, ask("what is the capital of france")).await, "x-aegis-cache"), "miss");
+    let r = h.post("/v1/chat/completions", &h.key, &[("x-aegis-cache", "exact")], &ask("What is the capital of France")).await;
+    assert_eq!(hdr(&r, "x-aegis-cache"), "miss");
+    let mut hot = ask("what is the capital of france");
+    hot["temperature"] = json!(0.9);
+    assert_eq!(hdr(&h.chat(&h.key, hot).await, "x-aegis-cache"), "skip");
+
+    // Too short to match by meaning.
+    h.chat(&h.key, ask("Yes ok")).await;
+    assert_eq!(hdr(&h.chat(&h.key, ask("yes ok")).await, "x-aegis-cache"), "miss");
+
+    let stats = h.state.semantic.stats();
+    assert_eq!(stats.hits, 2);
+    assert!(stats.stores >= 2);
+
+    // Logged as a semantic hit, and counted as a cache hit in the summary.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let rows = h.state.db.recent_requests(50).await.unwrap();
+    assert_eq!(rows.iter().filter(|r| r.cache == "semantic").count(), 2);
+    assert_eq!(h.state.db.summary(0).await.unwrap().cache_hits, 2);
+
+    // Purging from the dashboard empties the semantic index too.
+    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let r = client.post(format!("{}/ui/login", h.base)).body("token=admin-secret").header("content-type", "application/x-www-form-urlencoded").send().await.unwrap();
+    let cookie = r.headers().get("set-cookie").unwrap().to_str().unwrap().split(';').next().unwrap().to_string();
+    client.post(format!("{}/ui/cache/purge", h.base)).header("cookie", &cookie).send().await.unwrap();
+    assert_eq!(h.state.semantic.stats().entries, 0);
+    assert_eq!(hdr(&h.chat(&h.key, ask("what is the capital of france")).await, "x-aegis-cache"), "miss");
+}
+
+#[tokio::test]
+async fn semantic_cache_survives_a_dead_embedding_model() {
+    let h = harness_with(&SEMANTIC.replace("embed/emb", "embdown/emb")).await;
+    let mut m = msg("good/m", "What is the capital of France?");
+    m["temperature"] = json!(0);
+    for expected in ["miss", "hit"] {
+        let r = h.chat(&h.key, m.clone()).await;
+        assert_eq!(r.status(), 200);
+        assert_eq!(hdr(&r, "x-aegis-cache"), expected);
+    }
+    assert!(h.state.semantic.stats().embed_failures >= 1);
+}
+
+#[tokio::test]
+async fn alerts_fire_for_budget_and_cooldown_and_reach_the_webhook() {
+    let h = harness().await;
+    assert!(h.state.alerts.recent().is_empty());
+
+    // limited/m answers 429: one cooldown alert, not one per request.
+    h.chat(&h.key, msg("fast", "hi")).await;
+    h.chat(&h.key, msg("fast", "hi")).await;
+    let cool: Vec<_> = h.state.alerts.recent().into_iter().filter(|a| a.kind == "cooldown").collect();
+    assert_eq!(cool.iter().filter(|a| a.title.contains("limited/m")).count(), 1);
+    assert!(cool.iter().any(|a| a.detail.contains("slow down")));
+
+    // The absurdly priced model blows the $5 budget in one request.
+    h.chat(&h.key, msg("paid-only", "hi")).await;
+    let budget: Vec<_> = h.state.alerts.recent().into_iter().filter(|a| a.kind == "budget").collect();
+    assert_eq!(budget.len(), 1);
+    assert_eq!(budget[0].severity, aegis::alerts::Severity::Critical);
+    assert!(budget[0].title.contains("full"));
+
+    // The Alerts page lists them, and its test button raises one more.
+    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let r = client.post(format!("{}/ui/login", h.base)).body("token=admin-secret").header("content-type", "application/x-www-form-urlencoded").send().await.unwrap();
+    let cookie = r.headers().get("set-cookie").unwrap().to_str().unwrap().split(';').next().unwrap().to_string();
+    let page = client.get(format!("{}/ui/alerts", h.base)).header("cookie", &cookie).send().await.unwrap().text().await.unwrap();
+    assert!(page.contains("has used its daily budget") && page.contains("limited/m is cooling down"));
+    assert_eq!(client.post(format!("{}/ui/alerts/test", h.base)).send().await.unwrap().status(), 303);
+    let before = h.state.alerts.recent().len();
+    let r = client.post(format!("{}/ui/alerts/test", h.base)).header("cookie", &cookie).send().await.unwrap();
+    assert!(r.text().await.unwrap().contains("Test alert"));
+    assert_eq!(h.state.alerts.recent().len(), before + 1);
+
+    // Delivery: a configured webhook receives the alert as JSON.
+    let got: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+    let sink = got.clone();
+    let hook = spawn(Router::new().route(
+        "/hook",
+        post(move |Json(v): Json<Value>| {
+            let sink = sink.clone();
+            async move {
+                sink.lock().unwrap().push(v);
+                StatusCode::NO_CONTENT
+            }
+        }),
+    ))
+    .await;
+    let alerts = aegis::alerts::Alerts::new(&aegis::config::AlertsCfg::default(), Some(format!("{hook}/hook")));
+    assert!(alerts.webhook_configured());
+    alerts.on_cooldown("groq/m", 30, "rate limited by provider");
+    for _ in 0..50 {
+        if alerts.delivery().sent == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let got = got.lock().unwrap().clone();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0]["event"], "cooldown");
+    assert!(got[0]["text"].as_str().unwrap().contains("groq/m is cooling down"));
+
+    // A dead webhook is reported, not fatal.
+    let dead = aegis::alerts::Alerts::new(&aegis::config::AlertsCfg::default(), Some("http://127.0.0.1:1/hook".into()));
+    dead.on_cooldown("groq/m", 30, "x");
+    for _ in 0..100 {
+        if dead.delivery().failed == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(dead.delivery().last_error.unwrap().contains("unreachable"));
+}
+
+#[tokio::test]
+async fn provider_test_button_reports_working_and_broken_providers() {
+    let h = harness().await;
+    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let form = |body: &str| client.post(format!("{}/ui/providers/test", h.base)).body(body.to_string()).header("content-type", "application/x-www-form-urlencoded");
+    assert_eq!(form("provider=good").send().await.unwrap().status(), 303);
+
+    let r = client.post(format!("{}/ui/login", h.base)).body("token=admin-secret").header("content-type", "application/x-www-form-urlencoded").send().await.unwrap();
+    let cookie = r.headers().get("set-cookie").unwrap().to_str().unwrap().split(';').next().unwrap().to_string();
+
+    let page = form("provider=good").header("cookie", &cookie).send().await.unwrap().text().await.unwrap();
+    assert!(page.contains("good is working: m answered in"));
+    let page = form("provider=down").header("cookie", &cookie).send().await.unwrap().text().await.unwrap();
+    assert!(page.contains("down could not be reached or failed"));
+    let page = form("provider=limited").header("cookie", &cookie).send().await.unwrap().text().await.unwrap();
+    assert!(page.contains("rate limiting it right now"));
+    let page = form("provider=nokey").header("cookie", &cookie).send().await.unwrap().text().await.unwrap();
+    assert!(page.contains("nokey has no API key yet"));
+    // Embedding-only providers are tested with an embedding.
+    let page = form("provider=embed").header("cookie", &cookie).send().await.unwrap().text().await.unwrap();
+    assert!(page.contains("embed is working"));
+    // A failed test does not trip the circuit breaker.
+    assert_eq!(h.state.quota.view("down/m").failures, 0);
 }

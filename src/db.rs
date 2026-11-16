@@ -347,7 +347,7 @@ impl Db {
     pub async fn summary(&self, since_ms: i64) -> Result<Summary> {
         let r = sqlx::query(
             "SELECT COUNT(*),
-                COALESCE(SUM(cache = 'hit'), 0),
+                COALESCE(SUM(cache IN ('hit', 'semantic')), 0),
                 COALESCE(SUM(status = 'error'), 0),
                 COALESCE(SUM(fallback), 0),
                 COALESCE(SUM(prompt_tokens), 0),
@@ -360,7 +360,7 @@ impl Db {
         .fetch_one(&self.pool)
         .await?;
         let lat: Vec<i64> = sqlx::query(
-            "SELECT latency_ms FROM requests WHERE ts >= ? AND status = 'ok' AND cache != 'hit'
+            "SELECT latency_ms FROM requests WHERE ts >= ? AND status = 'ok' AND cache NOT IN ('hit', 'semantic')
              ORDER BY latency_ms LIMIT 20000",
         )
         .bind(since_ms)
@@ -387,8 +387,8 @@ impl Db {
     pub async fn hourly(&self, since_ms: i64) -> Result<Vec<HourBucket>> {
         let rows = sqlx::query(
             "SELECT ts / 3600000,
-                COALESCE(SUM(cache != 'hit' AND status != 'error'), 0),
-                COALESCE(SUM(cache = 'hit'), 0),
+                COALESCE(SUM(cache NOT IN ('hit', 'semantic') AND status != 'error'), 0),
+                COALESCE(SUM(cache IN ('hit', 'semantic')), 0),
                 COALESCE(SUM(status = 'error'), 0)
              FROM requests WHERE ts >= ? GROUP BY 1 ORDER BY 1",
         )
@@ -408,7 +408,7 @@ impl Db {
                 COALESCE(SUM(prompt_tokens + completion_tokens), 0),
                 COALESCE(SUM(cost_usd), 0.0),
                 COALESCE(AVG(latency_ms), 0.0)
-             FROM requests WHERE ts >= ? AND provider != '' AND cache != 'hit'
+             FROM requests WHERE ts >= ? AND provider != '' AND cache NOT IN ('hit', 'semantic')
              GROUP BY provider, model, tier ORDER BY 4 DESC",
         )
         .bind(since_ms)
@@ -433,7 +433,7 @@ impl Db {
     pub async fn usage_by_minute(&self, since_ms: i64) -> Result<Vec<(String, i64, i64, i64)>> {
         let rows = sqlx::query(
             "SELECT provider || '/' || model, ts / 60000, COUNT(*), COALESCE(SUM(prompt_tokens + completion_tokens), 0)
-             FROM requests WHERE ts >= ? AND provider != '' AND cache != 'hit'
+             FROM requests WHERE ts >= ? AND provider != '' AND cache NOT IN ('hit', 'semantic')
              GROUP BY 1, 2 ORDER BY 2",
         )
         .bind(since_ms)

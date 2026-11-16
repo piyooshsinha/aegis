@@ -25,12 +25,21 @@ Every response says who answered:
 | Header | Meaning |
 | --- | --- |
 | `x-aegis-provider`, `x-aegis-model`, `x-aegis-tier` | The target that served the request |
-| `x-aegis-cache` | `hit`, `miss`, or `skip` (not cacheable) |
+| `x-aegis-cache` | `hit`, `semantic` (matched by meaning), `miss`, or `skip` (not cacheable) |
 | `x-aegis-fallback` | `true` when the first target of the route did not serve it |
 | `x-aegis-attempts` | How many targets were considered |
 
-Request headers: `x-aegis-cache: bypass` or `force`, and
+Request headers: `x-aegis-cache: bypass`, `force` or `exact`, and
 `x-aegis-no-fallback: true` to fail instead of falling back.
+
+### Embeddings
+
+`POST /v1/embeddings` takes the OpenAI request shape (`input` as a string or a
+list of strings, optional `dimensions`, `encoding_format` `float` or `base64`).
+Mark embedding models in the config with `capabilities = ["embeddings"]`; they
+are never used for chat. Vectors from different models cannot be compared, so
+a route only falls back between targets that serve the same model id as its
+first embedding target; other targets are skipped and reported.
 
 ## Run it
 
@@ -56,9 +65,34 @@ There are two ways to give a provider its key:
 - **Environment**: set the variable named by the provider's `api_key_env`
   (for example `GROQ_API_KEY`) before starting.
 
+"Test connection" on the same page sends one tiny request and says whether
+the provider accepted the key.
+
 A key saved in the dashboard takes precedence over the environment. Keep
 `AEGIS_SECRET_KEY` unchanged: keys saved under a different value cannot be
 decrypted and must be entered again.
+
+### Semantic caching
+
+Off by default; turn it on under `[cache.semantic]`. A cacheable request then
+also matches a stored answer when its last user message means the same as an
+earlier one, judged by cosine similarity of embeddings against `threshold`.
+Everything else must be identical: client key scope, model, parameters, system
+prompt and earlier turns. Requests with tools or images, and messages shorter
+than `min_chars`, are matched exactly only. If the embedding model is slow or
+down the request goes upstream as usual.
+
+A similarity score is not a guarantee. "What is 2+3?" and "What is 2+4?" are
+close in most embedding models, so keep the threshold high for anything where
+a near-match answer would be wrong, or send `x-aegis-cache: exact`. The index
+is in memory, is scanned linearly, and is emptied by a restart or a purge.
+
+### Alerts
+
+The dashboard's Alerts page lists a client key reaching 80% and 100% of its
+daily budget, and a model going into cooldown. Set `AEGIS_ALERT_WEBHOOK` to a
+URL to also receive each one as a JSON POST; the payload has `text` and
+`content` fields, so Slack and Discord incoming webhooks work unchanged.
 
 ## How the design gaps were closed
 
@@ -97,7 +131,8 @@ each provider's current documentation.
   them), forced `tool_choice` becomes `auto`, and `response_format` is not
   translated, so Anthropic models are not listed with the `json` capability.
 - Gemini: image input must be a `data:` URL.
-- Semantic (embedding) caching is not implemented; the cache is exact-match.
+- Embeddings: Anthropic has no embeddings API. Token-id arrays as `input` are
+  refused. Gemini does not report embedding token usage, so it is estimated.
 - Storage is SQLite only. Cache and quota state are per process, so run one
   instance.
 - Token counts are estimated at 4 characters per token for pre-flight checks,

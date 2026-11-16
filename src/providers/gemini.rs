@@ -1,6 +1,6 @@
 //! Google Gemini adapter using the native `generateContent` API.
 
-use super::{Adapter, ChunkStream, ProviderError, RateSnapshot, error_from_response, snapshot_from, transport_err};
+use super::{Adapter, ChunkStream, Embeddings, ProviderError, RateSnapshot, error_from_response, floats, snapshot_from, transport_err};
 use crate::config::ModelCfg;
 use crate::types::{ChatRequest, Completion, Usage, chunk_json, completion_json, new_completion_id, text_of, usage_chunk_json};
 use eventsource_stream::Eventsource;
@@ -259,6 +259,34 @@ pub async fn stream(a: &Adapter, model: &ModelCfg, req: &ChatRequest) -> Result<
         }
     };
     Ok((Box::pin(s), snap))
+}
+
+pub async fn embed(a: &Adapter, model: &ModelCfg, inputs: &[String], dimensions: Option<u64>) -> Result<(Embeddings, RateSnapshot), ProviderError> {
+    let requests: Vec<Value> = inputs
+        .iter()
+        .map(|text| {
+            let mut r = json!({ "model": format!("models/{}", model.id), "content": { "parts": [{ "text": text }] } });
+            if let Some(d) = dimensions {
+                r["outputDimensionality"] = json!(d);
+            }
+            r
+        })
+        .collect();
+    let resp = request(a, model, "batchEmbedContents", &json!({ "requests": requests })).timeout(a.timeout).send().await.map_err(transport_err)?;
+    if !resp.status().is_success() {
+        return Err(error_from_response(resp).await);
+    }
+    let snap = snapshot_from(resp.headers());
+    let v: Value = resp.json().await.map_err(transport_err)?;
+    let vectors = v
+        .get("embeddings")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ProviderError::Unavailable("provider returned an embeddings response without embeddings".into()))?
+        .iter()
+        .map(|e| floats(e.get("values")))
+        .collect();
+    // Gemini does not report token usage for embeddings.
+    Ok((Embeddings { vectors, prompt_tokens: None }, snap))
 }
 
 #[cfg(test)]

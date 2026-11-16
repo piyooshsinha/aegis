@@ -7,7 +7,9 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::HashSet;
 
-pub const KNOWN_CAPABILITIES: &[&str] = &["tools", "vision", "json"];
+/// `embeddings` marks an embedding model: it serves `/v1/embeddings` and is
+/// never used for chat.
+pub const KNOWN_CAPABILITIES: &[&str] = &["tools", "vision", "json", "embeddings"];
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -18,6 +20,8 @@ pub struct Config {
     pub auth: AuthCfg,
     #[serde(default)]
     pub cache: CacheCfg,
+    #[serde(default)]
+    pub alerts: AlertsCfg,
     #[serde(default)]
     pub providers: Vec<ProviderCfg>,
     #[serde(default)]
@@ -73,6 +77,55 @@ pub struct CacheCfg {
     /// (providers then sample at their default, usually 1.0).
     pub cache_when_temperature_unset: bool,
     pub scope: CacheScope,
+    pub semantic: SemanticCfg,
+}
+
+/// Semantic caching: a cacheable request whose last user message means the
+/// same as an earlier one (and whose every other part is identical) is served
+/// the earlier answer. Off by default, because "means the same" is a
+/// similarity score, not a guarantee.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SemanticCfg {
+    pub enabled: bool,
+    /// `provider/model` of a model with the `embeddings` capability.
+    pub embedding_model: String,
+    /// Minimum cosine similarity (0 to 1) to count as the same question.
+    pub threshold: f64,
+    pub max_entries: usize,
+    /// Messages shorter than this are matched exactly only; very short
+    /// prompts ("yes", "next") are too easy to confuse.
+    pub min_chars: usize,
+    /// Give up on the embedding call after this long and go upstream.
+    pub timeout_ms: u64,
+}
+
+impl Default for SemanticCfg {
+    fn default() -> Self {
+        Self { enabled: false, embedding_model: String::new(), threshold: 0.95, max_entries: 2000, min_chars: 16, timeout_ms: 3000 }
+    }
+}
+
+/// Alerts for things an operator should hear about without watching the
+/// dashboard. Always listed on the Alerts page; also posted to a webhook when
+/// the environment variable named here holds a URL.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AlertsCfg {
+    /// Name of the environment variable holding the webhook URL (a secret).
+    pub webhook_url_env: String,
+    /// Warn when a client key has spent this fraction of its daily budget.
+    pub budget_warn_at: f64,
+    /// Alert when a provider target starts cooling down.
+    pub cooldowns: bool,
+    /// Do not repeat the same alert more often than this.
+    pub min_interval_secs: u64,
+}
+
+impl Default for AlertsCfg {
+    fn default() -> Self {
+        Self { webhook_url_env: "AEGIS_ALERT_WEBHOOK".into(), budget_warn_at: 0.8, cooldowns: true, min_interval_secs: 300 }
+    }
 }
 
 impl Default for CacheCfg {
@@ -84,6 +137,7 @@ impl Default for CacheCfg {
             max_temperature: 0.0,
             cache_when_temperature_unset: false,
             scope: CacheScope::PerKey,
+            semantic: SemanticCfg::default(),
         }
     }
 }
@@ -240,6 +294,21 @@ impl Config {
                     bail!("route {:?}: target {:?} does not match any configured provider/model", r.alias, t);
                 }
             }
+        }
+        let sem = &self.cache.semantic;
+        if sem.enabled {
+            let Some((pi, mi)) = self.find_target(&sem.embedding_model) else {
+                bail!("cache.semantic.embedding_model {:?} does not match any configured provider/model", sem.embedding_model);
+            };
+            if !self.providers[pi].models[mi].has("embeddings") {
+                bail!("cache.semantic.embedding_model {:?} needs the \"embeddings\" capability", sem.embedding_model);
+            }
+            if !(0.5..=1.0).contains(&sem.threshold) {
+                bail!("cache.semantic.threshold must be between 0.5 and 1.0");
+            }
+        }
+        if !(0.0..=1.0).contains(&self.alerts.budget_warn_at) {
+            bail!("alerts.budget_warn_at must be between 0 and 1");
         }
         Ok(())
     }

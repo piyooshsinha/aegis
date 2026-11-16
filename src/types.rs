@@ -74,6 +74,30 @@ impl ChatRequest {
         (chars as u64).div_ceil(4)
     }
 
+    /// For semantic caching: the text of the last user message, and a hash
+    /// of everything else. Two requests may share an answer only if the
+    /// hashes are equal and the texts mean the same. `None` when the request
+    /// does not end in a plain-text user message, or uses tools or images,
+    /// where a near-match is not safe to reuse.
+    pub fn semantic_parts(&self, scope: &str, min_chars: usize) -> Option<(String, String)> {
+        if self.needs_tools() || self.needs_vision() {
+            return None;
+        }
+        let last = self.messages.last()?;
+        if last.get("role").and_then(Value::as_str) != Some("user") {
+            return None;
+        }
+        let text = text_of(last.get("content")?).trim().to_string();
+        if text.chars().count() < min_chars.max(1) {
+            return None;
+        }
+        let mut rest = self.clone();
+        if let Some(m) = rest.messages.last_mut() {
+            m["content"] = Value::Null;
+        }
+        Some((rest.fingerprint(&format!("semantic\u{0}{scope}")), text))
+    }
+
     /// Stable hash of everything that influences the answer.
     pub fn fingerprint(&self, scope: &str) -> String {
         let mut v = serde_json::to_value(self).unwrap_or(Value::Null);

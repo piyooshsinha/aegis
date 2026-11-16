@@ -142,6 +142,16 @@ pub async fn error_from_response(resp: reqwest::Response) -> ProviderError {
     }
 }
 
+pub struct Embeddings {
+    pub vectors: Vec<Vec<f32>>,
+    /// Input tokens as reported by the provider, if it reports them.
+    pub prompt_tokens: Option<u64>,
+}
+
+fn floats(v: Option<&Value>) -> Vec<f32> {
+    v.and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_f64).map(|f| f as f32).collect()).unwrap_or_default()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeySource {
     Dashboard,
@@ -209,6 +219,23 @@ impl Adapter {
             ProviderKind::Anthropic => anthropic::complete(self, model, req).await,
             ProviderKind::Gemini => gemini::complete(self, model, req).await,
         }
+    }
+
+    /// Embed each input as one vector, in order.
+    pub async fn embed(&self, model: &ModelCfg, inputs: &[String], dimensions: Option<u64>) -> Result<(Embeddings, RateSnapshot), ProviderError> {
+        let out = match self.kind {
+            ProviderKind::Openai => openai::embed(self, model, inputs, dimensions).await,
+            ProviderKind::Gemini => gemini::embed(self, model, inputs, dimensions).await,
+            ProviderKind::Anthropic => Err(ProviderError::Rejected { status: 400, message: "Anthropic has no embeddings API".into() }),
+        }?;
+        if out.0.vectors.len() != inputs.len() || out.0.vectors.iter().any(Vec::is_empty) {
+            return Err(ProviderError::Unavailable(format!(
+                "provider returned {} embeddings for {} inputs",
+                out.0.vectors.iter().filter(|v| !v.is_empty()).count(),
+                inputs.len()
+            )));
+        }
+        Ok(out)
     }
 
     /// Errors returned here happen before any byte reaches the client, so the

@@ -1,4 +1,4 @@
-//! Exact-match response cache.
+//! Response cache: exact-match, with an optional semantic layer.
 //!
 //! Caching a sampled answer makes a non-deterministic request deterministic,
 //! which is rarely what a caller wants. So a request is only cached when it
@@ -6,12 +6,13 @@
 //! ceiling, or a `seed`), or when the caller opts in with
 //! `x-aegis-cache: force`. Entries expire after a TTL and can be purged.
 
-use crate::config::{CacheCfg, CacheScope};
-use crate::types::{ChatRequest, Usage};
+use crate::config::{CacheCfg, CacheScope, SemanticCfg};
+use crate::types::{ChatRequest, Usage, now_ms};
 use axum::http::HeaderMap;
 use moka::future::Cache;
 use serde_json::Value;
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -20,6 +21,8 @@ pub enum CacheMode {
     Default,
     Bypass,
     Force,
+    /// Exact matches only: skip the semantic layer for this request.
+    Exact,
 }
 
 impl CacheMode {
@@ -28,6 +31,7 @@ impl CacheMode {
         match get("x-aegis-cache").as_deref() {
             Some("bypass") | Some("off") | Some("no-store") => return Self::Bypass,
             Some("force") => return Self::Force,
+            Some("exact") => return Self::Exact,
             _ => {}
         }
         match get("cache-control") {
@@ -108,6 +112,14 @@ impl ResponseCache {
         Some(req.fingerprint(scope))
     }
 
+    /// The partition label entries are filed under for this client.
+    pub fn scope_for<'a>(&self, key_scope: &'a str) -> &'a str {
+        match self.cfg.scope {
+            CacheScope::Global => "global",
+            CacheScope::PerKey => key_scope,
+        }
+    }
+
     pub async fn get(&self, key: &str) -> Option<Arc<CachedEntry>> {
         let hit = self.inner.get(key).await;
         if hit.is_some() {
@@ -136,6 +148,121 @@ impl ResponseCache {
             misses: self.misses.load(Ordering::Relaxed),
             stores: self.stores.load(Ordering::Relaxed),
             skipped: self.skipped.load(Ordering::Relaxed),
+        }
+    }
+}
+
+// ---- semantic layer -------------------------------------------------------
+
+struct SemEntry {
+    partition: String,
+    /// Unit-length embedding of the last user message.
+    vector: Vec<f32>,
+    entry: Arc<CachedEntry>,
+    expires_ms: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SemanticStats {
+    pub entries: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub stores: u64,
+    /// Lookups skipped because the embedding call failed or timed out.
+    pub embed_failures: u64,
+}
+
+/// Answers filed by the meaning of the last user message.
+///
+/// Two requests can only match if they are in the same partition: same
+/// client scope, model, parameters, system prompt and earlier turns. Within a
+/// partition, the stored answer whose message is most similar is returned if
+/// its cosine similarity reaches the threshold. Lookup is a linear scan,
+/// which is fast for the few thousand entries this is sized for.
+pub struct SemanticIndex {
+    cfg: SemanticCfg,
+    ttl_ms: i64,
+    entries: Mutex<VecDeque<SemEntry>>,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    stores: AtomicU64,
+    embed_failures: AtomicU64,
+}
+
+fn normalize(mut v: Vec<f32>) -> Option<Vec<f32>> {
+    let norm = v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();
+    if norm == 0.0 || !norm.is_finite() {
+        return None;
+    }
+    for x in &mut v {
+        *x = (*x as f64 / norm) as f32;
+    }
+    Some(v)
+}
+
+impl SemanticIndex {
+    pub fn new(cache: &CacheCfg) -> Self {
+        Self {
+            cfg: cache.semantic.clone(),
+            ttl_ms: (cache.ttl_secs.max(1) as i64) * 1000,
+            entries: Mutex::new(VecDeque::new()),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            stores: AtomicU64::new(0),
+            embed_failures: AtomicU64::new(0),
+        }
+    }
+
+    pub fn cfg(&self) -> &SemanticCfg {
+        &self.cfg
+    }
+
+    pub fn note_embed_failure(&self) {
+        self.embed_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The closest stored answer in this partition, with its similarity, if
+    /// it is close enough.
+    pub fn lookup(&self, partition: &str, vector: &[f32]) -> Option<(Arc<CachedEntry>, f64)> {
+        let query = normalize(vector.to_vec())?;
+        let now = now_ms();
+        let mut g = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        g.retain(|e| e.expires_ms > now);
+        let best = g
+            .iter()
+            .filter(|e| e.partition == partition && e.vector.len() == query.len())
+            .map(|e| (e, e.vector.iter().zip(&query).map(|(a, b)| (*a as f64) * (*b as f64)).sum::<f64>()))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .filter(|(_, sim)| *sim >= self.cfg.threshold)
+            .map(|(e, sim)| (e.entry.clone(), sim));
+        match &best {
+            Some(_) => self.hits.fetch_add(1, Ordering::Relaxed),
+            None => self.misses.fetch_add(1, Ordering::Relaxed),
+        };
+        best
+    }
+
+    pub fn insert(&self, partition: String, vector: Vec<f32>, entry: CachedEntry) {
+        let Some(vector) = normalize(vector) else { return };
+        self.stores.fetch_add(1, Ordering::Relaxed);
+        let mut g = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        g.push_back(SemEntry { partition, vector, entry: Arc::new(entry), expires_ms: now_ms() + self.ttl_ms });
+        while g.len() > self.cfg.max_entries.max(1) {
+            g.pop_front();
+        }
+    }
+
+    pub fn purge(&self) {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    pub fn stats(&self) -> SemanticStats {
+        SemanticStats {
+            entries: self.entries.lock().unwrap_or_else(|e| e.into_inner()).len() as u64,
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            stores: self.stores.load(Ordering::Relaxed),
+            embed_failures: self.embed_failures.load(Ordering::Relaxed),
         }
     }
 }
@@ -173,5 +300,44 @@ mod tests {
         let ka = c.key_for(&a, CacheMode::Default, "k1").unwrap();
         assert_eq!(ka, c.key_for(&b, CacheMode::Default, "k1").unwrap());
         assert_ne!(ka, c.key_for(&a, CacheMode::Default, "k2").unwrap());
+    }
+
+    fn entry(tag: &str) -> CachedEntry {
+        CachedEntry { body: json!({ "tag": tag }), provider: "p".into(), model: "m".into(), tier: "local".into(), usage: Usage::default(), cost_usd: 0.0, stored_at: 0 }
+    }
+
+    #[test]
+    fn semantic_lookup_needs_same_partition_and_enough_similarity() {
+        let idx = SemanticIndex::new(&CacheCfg::default());
+        idx.insert("a".into(), vec![1.0, 0.0, 0.0], entry("x"));
+        idx.insert("a".into(), vec![0.0, 1.0, 0.0], entry("y"));
+
+        // Nearly the same direction as the first entry; length is irrelevant.
+        let (hit, sim) = idx.lookup("a", &[5.0, 0.2, 0.0]).unwrap();
+        assert_eq!(hit.body["tag"], "x");
+        assert!(sim > 0.99);
+        // Halfway between the two entries is not close enough to either.
+        assert!(idx.lookup("a", &[1.0, 1.0, 0.0]).is_none());
+        // Same vector, different conversation or client.
+        assert!(idx.lookup("b", &[1.0, 0.0, 0.0]).is_none());
+        // Vectors from a different embedding model never match.
+        assert!(idx.lookup("a", &[1.0, 0.0]).is_none());
+        assert!(idx.lookup("a", &[0.0, 0.0, 0.0]).is_none());
+
+        idx.purge();
+        assert!(idx.lookup("a", &[1.0, 0.0, 0.0]).is_none());
+    }
+
+    #[test]
+    fn semantic_index_evicts_oldest() {
+        let mut cfg = CacheCfg::default();
+        cfg.semantic.max_entries = 2;
+        let idx = SemanticIndex::new(&cfg);
+        idx.insert("a".into(), vec![1.0, 0.0, 0.0], entry("1"));
+        idx.insert("a".into(), vec![0.0, 1.0, 0.0], entry("2"));
+        idx.insert("a".into(), vec![0.0, 0.0, 1.0], entry("3"));
+        assert_eq!(idx.stats().entries, 2);
+        assert!(idx.lookup("a", &[1.0, 0.0, 0.0]).is_none());
+        assert!(idx.lookup("a", &[0.0, 0.0, 1.0]).is_some());
     }
 }

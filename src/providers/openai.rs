@@ -1,7 +1,7 @@
 //! OpenAI-compatible providers: OpenAI, Groq, Ollama, vLLM, llama.cpp.
 //! The request is already in the right shape, so this is a pass-through.
 
-use super::{Adapter, ChunkStream, ProviderError, RateSnapshot, error_from_response, snapshot_from, transport_err};
+use super::{Adapter, ChunkStream, Embeddings, ProviderError, RateSnapshot, error_from_response, floats, snapshot_from, transport_err};
 use crate::config::ModelCfg;
 use crate::types::{ChatRequest, Completion, Usage};
 use eventsource_stream::Eventsource;
@@ -73,4 +73,32 @@ pub async fn stream(a: &Adapter, model: &ModelCfg, req: &ChatRequest) -> Result<
         }
     };
     Ok((Box::pin(s), snap))
+}
+
+pub async fn embed(a: &Adapter, model: &ModelCfg, inputs: &[String], dimensions: Option<u64>) -> Result<(Embeddings, RateSnapshot), ProviderError> {
+    let mut body = json!({ "model": model.id, "input": inputs, "encoding_format": "float" });
+    if let Some(d) = dimensions {
+        body["dimensions"] = json!(d);
+    }
+    let mut rb = a.client.post(format!("{}/embeddings", a.base_url)).json(&body);
+    if let Some(k) = a.api_key() {
+        rb = rb.bearer_auth(k);
+    }
+    let resp = rb.timeout(a.timeout).send().await.map_err(transport_err)?;
+    if !resp.status().is_success() {
+        return Err(error_from_response(resp).await);
+    }
+    let snap = snapshot_from(resp.headers());
+    let v: Value = resp.json().await.map_err(transport_err)?;
+    let mut rows: Vec<(u64, Vec<f32>)> = v
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ProviderError::Unavailable("provider returned an embeddings response without data".into()))?
+        .iter()
+        .enumerate()
+        .map(|(i, d)| (d.get("index").and_then(Value::as_u64).unwrap_or(i as u64), floats(d.get("embedding"))))
+        .collect();
+    rows.sort_by_key(|r| r.0);
+    let prompt_tokens = v.pointer("/usage/prompt_tokens").and_then(Value::as_u64);
+    Ok((Embeddings { vectors: rows.into_iter().map(|r| r.1).collect(), prompt_tokens }, snap))
 }

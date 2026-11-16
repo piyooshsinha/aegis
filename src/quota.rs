@@ -99,6 +99,13 @@ pub struct TargetView {
     pub remaining_tokens: Option<u64>,
 }
 
+/// A cooldown that has just begun, for alerting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cooldown {
+    pub secs: u64,
+    pub reason: String,
+}
+
 #[derive(Default)]
 pub struct QuotaTracker {
     inner: Mutex<HashMap<String, TargetState>>,
@@ -163,7 +170,7 @@ impl QuotaTracker {
         });
     }
 
-    pub fn on_success(&self, target: &str, snap: &RateSnapshot) {
+    pub fn on_success(&self, target: &str, snap: &RateSnapshot) -> Option<Cooldown> {
         let now = now_secs();
         self.with(target, |s| {
             s.failures = 0;
@@ -180,11 +187,13 @@ impl QuotaTracker {
                 let secs = reset.as_secs().clamp(1, MAX_COOLDOWN_SECS);
                 s.cooldown_until = now + secs;
                 s.cooldown_reason = "provider reports quota exhausted".into();
+                return Some(Cooldown { secs, reason: s.cooldown_reason.clone() });
             }
-        });
+            None
+        })
     }
 
-    pub fn on_rate_limited(&self, target: &str, retry_after: Option<Duration>, message: &str) {
+    pub fn on_rate_limited(&self, target: &str, retry_after: Option<Duration>, message: &str) -> Cooldown {
         let now = now_secs();
         self.with(target, |s| {
             let secs = retry_after.map(|d| d.as_secs().max(1)).unwrap_or(DEFAULT_COOLDOWN_SECS).min(MAX_COOLDOWN_SECS);
@@ -192,20 +201,24 @@ impl QuotaTracker {
             s.cooldown_reason = "rate limited by provider".into();
             s.last_error = Some(format!("429: {message}"));
             s.remaining_requests = Some(0);
-        });
+            Cooldown { secs, reason: format!("rate limited by provider: {message}") }
+        })
     }
 
-    pub fn on_failure(&self, target: &str, message: &str) {
+    pub fn on_failure(&self, target: &str, message: &str) -> Option<Cooldown> {
         let now = now_secs();
         self.with(target, |s| {
             s.failures += 1;
             s.last_error = Some(message.to_string());
             if s.failures >= BREAKER_THRESHOLD {
                 let exp = (s.failures - BREAKER_THRESHOLD).min(4);
-                s.cooldown_until = now + (30u64 << exp).min(300);
+                let secs = (30u64 << exp).min(300);
+                s.cooldown_until = now + secs;
                 s.cooldown_reason = format!("{} consecutive failures", s.failures);
+                return Some(Cooldown { secs, reason: format!("{} (last: {message})", s.cooldown_reason) });
             }
-        });
+            None
+        })
     }
 
     pub fn view(&self, target: &str) -> TargetView {

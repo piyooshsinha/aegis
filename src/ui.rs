@@ -29,6 +29,9 @@ pub fn routes() -> Router<Shared> {
         .route("/ui/requests", get(requests))
         .route("/ui/providers", get(providers))
         .route("/ui/providers/reset", post(reset_target))
+        .route("/ui/providers/test", post(test_provider))
+        .route("/ui/alerts", get(alerts))
+        .route("/ui/alerts/test", post(test_alert))
         .route("/ui/providers/key", post(set_provider_key))
         .route("/ui/providers/key/remove", post(remove_provider_key))
         .route("/ui/keys", get(keys).post(create_key))
@@ -198,6 +201,7 @@ fn page(title: &str, active: &str, live: bool, body: Markup) -> Markup {
         ("/ui/providers", "Providers"),
         ("/ui/keys", "Keys"),
         ("/ui/cache", "Cache"),
+        ("/ui/alerts", "Alerts"),
         ("/ui/playground", "Playground"),
     ];
     html! {
@@ -369,9 +373,9 @@ async fn requests(State(state): State<Shared>, headers: HeaderMap) -> Response {
                                     }
                                     (attempts_view(r))
                                 }
-                                td { (badge(match r.cache.as_str() { "hit" => "ok", "miss" => "plain", _ => "dim" }, &r.cache)) }
+                                td { (badge(match r.cache.as_str() { "hit" | "semantic" => "ok", "miss" => "plain", _ => "dim" }, &r.cache)) }
                                 td.n { (int(r.prompt_tokens)) " / " (int(r.completion_tokens)) @if r.usage_estimated { span.muted title="Provider did not report usage; estimated" { " ~" } } }
-                                td.n { @if r.cache == "hit" { span.muted { "saved " (usd(r.saved_usd)) } } @else { (usd(r.cost_usd)) } }
+                                td.n { @if r.cache == "hit" || r.cache == "semantic" { span.muted { "saved " (usd(r.saved_usd)) } } @else { (usd(r.cost_usd)) } }
                                 td.n { (ms(r.latency_ms)) }
                                 td { (badge(match r.status.as_str() { "ok" => "ok", "error" => "bad", _ => "warn" }, &r.status)) }
                             }
@@ -403,10 +407,23 @@ async fn providers(State(state): State<Shared>, headers: HeaderMap) -> Response 
     providers_view(&state, None).into_response()
 }
 
-fn providers_view(state: &Shared, error: Option<String>) -> Markup {
+/// A one-off message at the top of a page: `Ok` for success, `Err` for failure.
+type Flash = Result<String, String>;
+
+fn flash_view(flash: &Option<Flash>) -> Markup {
+    html! {
+        @match flash {
+            Some(Ok(m)) => p.alert.good { (m) },
+            Some(Err(m)) => p.alert { (m) },
+            None => {},
+        }
+    }
+}
+
+fn providers_view(state: &Shared, flash: Option<Flash>) -> Markup {
     let stored = state.stored_keys.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let body = html! {
-        @if let Some(e) = &error { p.alert { (e) } }
+        (flash_view(&flash))
         section.card {
             h2 { "Routes" }
             p.muted { "A request for an alias goes to the first target that is configured, capable of the request, and within quota." }
@@ -439,6 +456,12 @@ fn providers_view(state: &Shared, error: Option<String>) -> Markup {
                     @else { (badge("bad", "no API key")) }
                 }
                 p.muted { (p.kind.as_str()) " · " span.mono { (p.base_url) } }
+                @if configured && !p.models.is_empty() {
+                    form.inline method="post" action="/ui/providers/test" {
+                        input type="hidden" name="provider" value=(p.name);
+                        button.ghost.small type="submit" { "Test connection" }
+                    }
+                }
                 @if needs_key {
                     @if state.sealer.is_some() {
                         details.keybox {
@@ -517,12 +540,18 @@ async fn set_provider_key(State(state): State<Shared>, headers: HeaderMap, Form(
         state.set_provider_key(&f.provider, key).await.err().map(|e| format!("Could not save the key: {e}"))
     };
     match problem {
-        Some(e) => (StatusCode::BAD_REQUEST, providers_view(&state, Some(e))).into_response(),
+        Some(e) => (StatusCode::BAD_REQUEST, providers_view(&state, Some(Err(e)))).into_response(),
         None => {
             tracing::info!(provider = %f.provider, "provider key set from dashboard");
             Redirect::to("/ui/providers").into_response()
         }
     }
+}
+
+async fn test_provider(State(state): State<Shared>, headers: HeaderMap, Form(f): Form<ProviderKeyForm>) -> Response {
+    require_admin!(state, headers);
+    let result = state.test_provider(&f.provider).await;
+    providers_view(&state, Some(result)).into_response()
 }
 
 async fn remove_provider_key(State(state): State<Shared>, headers: HeaderMap, Form(f): Form<ProviderKeyForm>) -> Response {
@@ -532,7 +561,7 @@ async fn remove_provider_key(State(state): State<Shared>, headers: HeaderMap, Fo
             tracing::info!(provider = %f.provider, "provider key removed from dashboard");
             Redirect::to("/ui/providers").into_response()
         }
-        Err(e) => (StatusCode::BAD_REQUEST, providers_view(&state, Some(format!("Could not remove the key: {e}")))).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, providers_view(&state, Some(Err(format!("Could not remove the key: {e}"))))).into_response(),
     }
 }
 
@@ -656,12 +685,86 @@ async fn revoke_key(State(state): State<Shared>, headers: HeaderMap, Path(id): P
     Redirect::to("/ui/keys").into_response()
 }
 
+// ---- alerts ---------------------------------------------------------------
+
+fn alerts_view(state: &Shared, flash: Option<Flash>) -> Markup {
+    let cfg = state.alerts.cfg();
+    let d = state.alerts.delivery();
+    let recent = state.alerts.recent();
+    let body = html! {
+        (flash_view(&flash))
+        section.card {
+            div.card-head {
+                h2 { "Delivery" }
+                @if state.alerts.webhook_configured() { (badge("ok", "webhook configured")) } @else { (badge("dim", "dashboard only")) }
+            }
+            @if state.alerts.webhook_configured() {
+                p.muted {
+                    "Each alert is posted as JSON to the URL in " span.mono { (cfg.webhook_url_env) } ". "
+                    (int(d.sent as i64)) " delivered, " (int(d.failed as i64)) " failed since the gateway started."
+                }
+                @if let Some(e) = &d.last_error { p.err-text { "Last delivery failed: " (e) } }
+            } @else {
+                p.muted {
+                    "Alerts are listed here only. To also receive them elsewhere, set " span.mono { (cfg.webhook_url_env) }
+                    " to a webhook URL and restart. Slack and Discord incoming webhooks work as they are."
+                }
+            }
+            dl.kv {
+                dt { "Budget" } dd { "When a client key reaches " (format!("{:.0}%", cfg.budget_warn_at * 100.0)) " of its daily budget, and again when it is used up" }
+                dt { "Providers" } dd { @if cfg.cooldowns { "When a model starts cooling down after rate limiting or repeated failures" } @else { "Cooldown alerts are off" } }
+                dt { "Repeats" } dd { "The same alert is not raised again within " (int(cfg.min_interval_secs as i64)) " seconds" }
+            }
+            form method="post" action="/ui/alerts/test" { button.ghost type="submit" { "Send a test alert" } }
+        }
+        section.card {
+            h2 { "Recent alerts" }
+            @if recent.is_empty() {
+                p.muted { "No alerts since the gateway started." }
+            } @else {
+                div.table-wrap { table {
+                    thead { tr { th { "When" } th { "Level" } th { "Alert" } } }
+                    tbody {
+                        @for a in &recent {
+                            tr {
+                                td { (time(a.ts)) }
+                                td { (badge(match a.severity { crate::alerts::Severity::Critical => "bad", crate::alerts::Severity::Warning => "warn", _ => "plain" }, a.severity.as_str())) }
+                                td { div.strong { (a.title) } div.muted { (a.detail) } }
+                            }
+                        }
+                    }
+                } }
+            }
+        }
+    };
+    page("Alerts", "/ui/alerts", true, body)
+}
+
+async fn alerts(State(state): State<Shared>, headers: HeaderMap) -> Response {
+    require_admin!(state, headers);
+    alerts_view(&state, None).into_response()
+}
+
+async fn test_alert(State(state): State<Shared>, headers: HeaderMap) -> Response {
+    require_admin!(state, headers);
+    let id = format!("test:{}", now_ms());
+    state.alerts.emit(&id, "test", crate::alerts::Severity::Info, "Test alert".into(), "Sent from the Aegis dashboard to check alert delivery.".into());
+    let msg = if state.alerts.webhook_configured() {
+        "Test alert raised and sent to the webhook. Delivery status appears here within a few seconds."
+    } else {
+        "Test alert raised. No webhook is configured, so it is only listed below."
+    };
+    alerts_view(&state, Some(Ok(msg.into()))).into_response()
+}
+
 // ---- cache ----------------------------------------------------------------
 
 async fn cache(State(state): State<Shared>, headers: HeaderMap) -> Response {
     require_admin!(state, headers);
     let s = state.cache.stats().await;
     let c = state.cache.cfg();
+    let sem = state.semantic.stats();
+    let sc = state.semantic.cfg();
     let lookups = s.hits + s.misses;
     let body = html! {
         p.muted { "Counters since the gateway started." }
@@ -685,6 +788,32 @@ async fn cache(State(state): State<Shared>, headers: HeaderMap) -> Response {
             }
         }
         section.card {
+            div.card-head {
+                h2 { "Semantic matching" }
+                @if sc.enabled && c.enabled { (badge("ok", "enabled")) } @else { (badge("dim", "disabled")) }
+            }
+            p.muted {
+                "Serves a stored answer when the last user message means the same as an earlier one and everything else in the request is identical. "
+                "Responses are marked " code { "x-aegis-cache: semantic" } " with the similarity score."
+            }
+            @if sc.enabled {
+                section.tiles {
+                    div.tile { span.k { "Entries" } span.v { (int(sem.entries as i64)) } span.sub { "of " (int(sc.max_entries as i64)) " max" } }
+                    div.tile { span.k { "Semantic hits" } span.v { (int(sem.hits as i64)) } span.sub { (int(sem.misses as i64)) " lookups found nothing close" } }
+                    div.tile { span.k { "Stored" } span.v { (int(sem.stores as i64)) } span.sub { "answers indexed" } }
+                    div.tile { span.k { "Embedding failures" } span.v { (int(sem.embed_failures as i64)) } span.sub { "lookups skipped" } }
+                }
+                dl.kv {
+                    dt { "Embedding model" } dd.mono { (sc.embedding_model) }
+                    dt { "Match when" } dd { "cosine similarity ≥ " (sc.threshold) }
+                    dt { "Applies to" } dd { "cacheable text requests of " (sc.min_chars) "+ characters, without tools or images" }
+                    dt { "Per request" } dd { code { "x-aegis-cache: exact" } " allows exact matches only" }
+                }
+            } @else {
+                p.muted { "Turn it on under " code { "[cache.semantic]" } " in the config file. It needs a model with the " code { "embeddings" } " capability." }
+            }
+        }
+        section.card {
             h2 { "Purge" }
             p.muted { "Removes every cached response. The next identical request goes to a provider." }
             form method="post" action="/ui/cache/purge" data-confirm="Remove all cached responses?" { button.danger type="submit" { "Purge cache" } }
@@ -696,6 +825,7 @@ async fn cache(State(state): State<Shared>, headers: HeaderMap) -> Response {
 async fn purge_cache(State(state): State<Shared>, headers: HeaderMap) -> Response {
     require_admin!(state, headers);
     state.cache.purge().await;
+    state.semantic.purge();
     Redirect::to("/ui/cache").into_response()
 }
 
@@ -844,6 +974,7 @@ form.inline{display:inline}
 .notice{border-color:var(--accent)}
 .copy-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .secret{padding:8px 10px;overflow-wrap:anywhere;flex:1;min-width:0}
+.alert.good{background:var(--ok-bg);color:var(--ok)}
 .alert{background:var(--bad-bg);color:var(--bad);padding:10px 12px;border-radius:8px;margin:12px 0}
 .kv{display:grid;grid-template-columns:max-content 1fr;gap:8px 20px;margin:0}
 .kv dt{color:var(--muted)}.kv dd{margin:0}
@@ -918,7 +1049,7 @@ const JS: &str = r#"
         var h=r.headers;
         if(h.get('x-aegis-provider'))pill(h.get('x-aegis-provider')+'/'+h.get('x-aegis-model'));
         if(h.get('x-aegis-tier'))pill(h.get('x-aegis-tier'),'tier-'+h.get('x-aegis-tier'));
-        if(h.get('x-aegis-cache'))pill('cache '+h.get('x-aegis-cache'),h.get('x-aegis-cache')==='hit'?'ok':'dim');
+        if(h.get('x-aegis-cache'))pill('cache '+h.get('x-aegis-cache'),(h.get('x-aegis-cache')==='hit'||h.get('x-aegis-cache')==='semantic')?'ok':'dim');
         if(h.get('x-aegis-fallback')==='true')pill('fallback','warn');
         var usage=null;
         if(!r.ok){
