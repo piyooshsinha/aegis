@@ -18,8 +18,10 @@ services:
       - ./aegis.nuc.toml:/app/aegis.toml:ro
       - aegis-data:/app/data
 
-  # Serves the embedding model locally. After the first start, fetch it once:
+  # Serves the embedding model and a small last-resort chat model locally.
+  # After the first start, fetch them once:
   #   docker exec aegis-ollama ollama pull nomic-embed-text
+  #   docker exec aegis-ollama ollama pull qwen2.5:3b
   aegis-ollama:
     image: ollama/ollama:latest
     container_name: aegis-ollama

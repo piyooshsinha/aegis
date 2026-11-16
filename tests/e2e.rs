@@ -886,3 +886,36 @@ async fn exact_cache_survives_a_restart_and_embedding_model_is_warmed() {
     let r = h.http.post(format!("{base3}/v1/chat/completions")).bearer_auth(&h.key).json(&m).send().await.unwrap();
     assert_eq!(hdr(&r, "x-aegis-cache"), "miss");
 }
+
+#[tokio::test]
+async fn usage_is_broken_down_by_client_key() {
+    let h = harness().await;
+    let mut cold = msg("good/m", "same question");
+    cold["temperature"] = json!(0);
+    h.chat(&h.key, cold.clone()).await; // upstream
+    h.chat(&h.key, cold.clone()).await; // cache hit
+    h.chat(&h.key, msg("paid-only", "hi")).await; // costs money
+    h.chat(&h.free_key, msg("good/m", "hi")).await;
+    h.chat(&h.free_key, msg("reject", "hi")).await; // provider error
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let rows = h.state.db.by_key(0).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    // Biggest spender first.
+    let (full, free) = (&rows[0], &rows[1]);
+    assert_eq!((full.key_name.as_str(), full.requests, full.cache_hits, full.errors), ("full", 3, 1, 0));
+    assert!(full.cost_usd > 0.0);
+    // 9 tokens for each of the two upstream calls; the cache hit adds none.
+    assert_eq!(full.tokens, 18);
+    assert_eq!((free.key_name.as_str(), free.requests, free.cache_hits, free.errors), ("free", 2, 0, 1));
+    assert_eq!(free.cost_usd, 0.0);
+    assert!(h.state.db.by_key(aegis::types::now_ms() + 60_000).await.unwrap().is_empty());
+
+    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let r = client.post(format!("{}/ui/login", h.base)).body("token=admin-secret").header("content-type", "application/x-www-form-urlencoded").send().await.unwrap();
+    let cookie = r.headers().get("set-cookie").unwrap().to_str().unwrap().split(';').next().unwrap().to_string();
+    for days in ["", "?days=7", "?days=30", "?days=999"] {
+        let page = client.get(format!("{}/ui/keys{days}", h.base)).header("cookie", &cookie).send().await.unwrap().text().await.unwrap();
+        assert!(page.contains("Usage by key") && page.contains("100%"), "{days}");
+    }
+}

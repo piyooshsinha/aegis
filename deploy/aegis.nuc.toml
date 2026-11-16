@@ -77,13 +77,21 @@ timeout_secs = 300
 
 # Ollama running on the NUC itself (the aegis-ollama container in
 # compose.yml). It serves the embedding model, so embeddings and semantic
-# caching do not depend on the Mac being awake.
+# caching do not depend on the Mac being awake, and a small chat model that
+# routes use as a last resort when nothing better is reachable.
 [[providers]]
 name = "ollama-nuc"
 kind = "openai"
 base_url = "http://127.0.0.1:11437/v1"
 tier = "local"
-timeout_secs = 60
+timeout_secs = 300
+
+  # Runs on the NUC's CPU: slower and less capable than the Mac's 7b model.
+  # Ollama 0.34 loads it with a 4096-token context.
+  [[providers.models]]
+  id = "qwen2.5:3b"
+  context_window = 4096
+  capabilities = ["tools", "json"]
 
   # Ollama loads this model with a 2048-token context and silently truncates
   # longer inputs, so longer ones are refused here instead.
@@ -185,17 +193,17 @@ tier = "paid"
 [[routes]]
 alias = "fast-model"
 description = "Cheapest quick answer: free tier, then local, then paid"
-targets = ["groq/llama-3.1-8b-instant", "ollama/qwen2.5:7b", "anthropic/claude-haiku-5-5"]
+targets = ["groq/llama-3.1-8b-instant", "ollama/qwen2.5:7b", "ollama-nuc/qwen2.5:3b", "anthropic/claude-haiku-5-5"]
 
 [[routes]]
 alias = "smart-model"
 description = "Best quality available, free first"
-targets = ["groq/llama-3.3-70b-versatile", "gemini/gemini-2.5-flash", "anthropic/claude-sonnet-5-5"]
+targets = ["groq/llama-3.3-70b-versatile", "gemini/gemini-2.5-flash", "anthropic/claude-sonnet-5-5", "ollama/qwen2.5:7b", "ollama-nuc/qwen2.5:3b"]
 
 [[routes]]
 alias = "local-model"
 description = "Never leaves this machine"
-targets = ["ollama/qwen2.5:7b", "ollama/qwen2.5-coder:3b"]
+targets = ["ollama/qwen2.5:7b", "ollama/qwen2.5-coder:3b", "ollama-nuc/qwen2.5:3b"]
 
 [[routes]]
 alias = "vision-model"

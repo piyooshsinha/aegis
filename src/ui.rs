@@ -8,7 +8,7 @@ use crate::db::{HourBucket, RequestRecord};
 use crate::gateway::{ChatOpts, Shared, run_chat};
 use crate::providers::KeySource;
 use crate::types::{ChatRequest, now_ms};
-use axum::extract::{Form, Path, State};
+use axum::extract::{Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
@@ -593,8 +593,11 @@ struct KeyForm {
     allow_paid: Option<String>,
 }
 
-async fn keys_view(state: &Shared, created: Option<(String, String)>, error: Option<String>) -> Markup {
+async fn keys_view(state: &Shared, created: Option<(String, String)>, error: Option<String>, days: i64) -> Markup {
     let rows = state.db.list_keys().await.unwrap_or_default();
+    let days = if [1, 7, 30].contains(&days) { days } else { 1 };
+    let usage = state.db.by_key(now_ms() - days * 86_400_000).await.unwrap_or_default();
+    let total_cost: f64 = usage.iter().map(|u| u.cost_usd).sum();
     let body = html! {
         @if let Some((name, key)) = &created {
             section.card.notice {
@@ -646,35 +649,73 @@ async fn keys_view(state: &Shared, created: Option<(String, String)>, error: Opt
                 } }
             }
         }
+        section.card {
+            div.card-head {
+                h2 { "Usage by key" }
+                div.seg {
+                    @for (d, label) in [(1, "24 hours"), (7, "7 days"), (30, "30 days")] {
+                        a.active[d == days] href=(format!("/ui/keys?days={d}")) { (label) }
+                    }
+                }
+            }
+            @if usage.is_empty() {
+                p.empty { "No requests in this period." }
+            } @else {
+                div.table-wrap { table {
+                    thead { tr { th { "Key" } th.n { "Requests" } th.n { "From cache" } th.n { "Errors" } th.n { "Tokens" } th.n { "Spend" } th.n { "Share" } th.n { "Saved by cache" } th { "Last used" } } }
+                    tbody {
+                        @for u in &usage {
+                            tr {
+                                td { @if u.key_name.is_empty() { span.muted { "(no key)" } } @else { (u.key_name) } }
+                                td.n { (int(u.requests)) }
+                                td.n { (pct(u.cache_hits, u.requests)) }
+                                td.n { (int(u.errors)) }
+                                td.n { (compact(u.tokens.max(0) as u64)) }
+                                td.n { (usd(u.cost_usd)) }
+                                td.n { @if total_cost > 0.0 { (format!("{:.0}%", u.cost_usd / total_cost * 100.0)) } @else { "–" } }
+                                td.n { (usd(u.saved_usd)) }
+                                td.nowrap { (time(u.last_ts)) }
+                            }
+                        }
+                    }
+                } }
+                p.muted { "Requests refused for a missing or invalid key are listed under the name they were logged with. Tokens exclude answers served from cache." }
+            }
+        }
     };
     page("Keys", "/ui/keys", false, body)
 }
 
-async fn keys(State(state): State<Shared>, headers: HeaderMap) -> Response {
+#[derive(Deserialize)]
+struct UsageQuery {
+    days: Option<i64>,
+}
+
+async fn keys(State(state): State<Shared>, headers: HeaderMap, Query(q): Query<UsageQuery>) -> Response {
     require_admin!(state, headers);
-    keys_view(&state, None, None).await.into_response()
+    keys_view(&state, None, None, q.days.unwrap_or(1)).await.into_response()
 }
 
 async fn create_key(State(state): State<Shared>, headers: HeaderMap, Form(f): Form<KeyForm>) -> Response {
     require_admin!(state, headers);
     let name = f.name.trim();
     if name.is_empty() {
-        return keys_view(&state, None, Some("Give the key a name.".into())).await.into_response();
+        return keys_view(&state, None, Some("Give the key a name.".into()), 1).await.into_response();
     }
     let rpm = f.rpm.trim().parse::<i64>().ok().filter(|v| *v > 0);
     let budget = f.daily_budget.trim().parse::<f64>().ok().filter(|v| *v >= 0.0);
     let models: Vec<&str> = f.models.split(',').map(str::trim).filter(|m| !m.is_empty()).collect();
     if let Some(bad) = models.iter().find(|m| state.resolve(m).is_empty()) {
-        return keys_view(&state, None, Some(format!("Unknown model or alias: {bad}"))).await.into_response();
+        return keys_view(&state, None, Some(format!("Unknown model or alias: {bad}")), 1).await.into_response();
     }
     let key = generate_key();
     let prefix: String = key.chars().take(crate::auth::KEY_PREFIX.len() + 6).collect();
     match state.db.create_key(name, &prefix, &hash_key(&key), rpm, budget, f.allow_paid.is_some(), &models.join(",")).await {
         Ok(_) => {
             let _ = state.keys.reload(&state.db).await;
-            keys_view(&state, Some((name.to_string(), key)), None).await.into_response()
+            keys_view(&state, Some((name.to_string(), key)), None, 1).await.into_response()
         }
-        Err(e) => keys_view(&state, None, Some(format!("Could not create the key: {e}"))).await.into_response(),
+        Err(e) => keys_view(&state, None, Some(format!("Could not create the key: {e}")), 1).await.into_response(),
     }
 }
 
@@ -914,6 +955,9 @@ h2{font-size:15px;margin:0 0 12px;font-weight:650}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin-top:16px}
 .card-head{display:flex;justify-content:space-between;align-items:center;gap:12px}
 .card-head h2{margin:0}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;font-size:13px}
+.seg a{padding:4px 10px;color:var(--muted);text-decoration:none}
+.seg a.active{background:var(--soft);color:var(--ink);font-weight:600}
 .tiles{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:8px}
 @media (min-width:1100px){.tiles{grid-template-columns:repeat(6,minmax(0,1fr))}.tiles:has(.tile:nth-child(4):last-child){grid-template-columns:repeat(4,minmax(0,1fr))}}
 @media (max-width:560px){.tiles{grid-template-columns:repeat(2,minmax(0,1fr))}}

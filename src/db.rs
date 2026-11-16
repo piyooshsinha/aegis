@@ -89,6 +89,20 @@ pub struct HourBucket {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct KeyStat {
+    pub key_id: Option<i64>,
+    pub key_name: String,
+    pub requests: i64,
+    pub cache_hits: i64,
+    pub errors: i64,
+    /// Tokens actually sent to and received from providers (cache hits excluded).
+    pub tokens: i64,
+    pub cost_usd: f64,
+    pub saved_usd: f64,
+    pub last_ts: i64,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct ProviderStat {
     pub provider: String,
     pub model: String,
@@ -494,6 +508,38 @@ impl Db {
         Ok(rows
             .iter()
             .map(|r| HourBucket { hour: r.get(0), upstream: r.get(1), cache_hits: r.get(2), errors: r.get(3) })
+            .collect())
+    }
+
+    /// What each client key did since `since_ms`, biggest spender first.
+    pub async fn by_key(&self, since_ms: i64) -> Result<Vec<KeyStat>> {
+        let rows = sqlx::query(
+            "SELECT key_id, key_name, COUNT(*),
+                COALESCE(SUM(cache IN ('hit', 'semantic')), 0),
+                COALESCE(SUM(status = 'error'), 0),
+                COALESCE(SUM(CASE WHEN cache IN ('hit', 'semantic') THEN 0 ELSE prompt_tokens + completion_tokens END), 0),
+                COALESCE(SUM(cost_usd), 0.0),
+                COALESCE(SUM(saved_usd), 0.0),
+                MAX(ts)
+             FROM requests WHERE ts >= ?
+             GROUP BY key_id, key_name ORDER BY 7 DESC, 3 DESC",
+        )
+        .bind(since_ms)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| KeyStat {
+                key_id: r.get(0),
+                key_name: r.get(1),
+                requests: r.get(2),
+                cache_hits: r.get(3),
+                errors: r.get(4),
+                tokens: r.get(5),
+                cost_usd: r.get(6),
+                saved_usd: r.get(7),
+                last_ts: r.get(8),
+            })
             .collect())
     }
 

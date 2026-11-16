@@ -52,7 +52,9 @@ cargo run --release -- key create --name my-app # prints a client key once
 
 Dashboard: `http://HOST:8787/ui`. Other commands: `aegis check`,
 `aegis key list`, `aegis key revoke <id>`. Keys can also be created and
-revoked in the dashboard, which takes effect immediately.
+revoked in the dashboard, which takes effect immediately. The Keys page also
+breaks usage down by client key (requests, cache share, tokens, spend) over
+24 hours, 7 days or 30 days.
 
 ### Provider API keys
 
@@ -145,8 +147,9 @@ each provider's current documentation.
 
 [deploy/compose.yml](deploy/compose.yml) builds the image and runs it with host
 networking. The NUC config ([deploy/aegis.nuc.toml](deploy/aegis.nuc.toml)) binds port 9001. Secrets go in `deploy/.env` (see `.env.example`). The compose file also runs a small
-Ollama container for the embedding model; fetch the model once with
-`docker exec aegis-ollama ollama pull nomic-embed-text`.
+Ollama container for the embedding model and a small last-resort chat model;
+fetch them once with `docker exec aegis-ollama ollama pull nomic-embed-text`
+and `docker exec aegis-ollama ollama pull qwen2.5:3b`.
 
 ```bash
 docker compose -f deploy/compose.yml up -d --build
