@@ -105,8 +105,9 @@ base_url = "https://generativelanguage.googleapis.com/v1beta"
 api_key_env = "GEMINI_API_KEY"
 tier = "free"
 
+  # A "-latest" alias, so it does not go stale when Google retires a version.
   [[providers.models]]
-  id = "gemini-2.5-flash"
+  id = "gemini-flash-latest"
   context_window = 1048576
   capabilities = ["tools", "vision", "json"]
   limits = { rpm = 10, rpd = 250, tpm = 250000 }
@@ -177,7 +178,7 @@ targets = ["groq/llama-3.1-8b-instant", "ollama/qwen2.5:7b", "anthropic/claude-h
 [[routes]]
 alias = "smart-model"
 description = "Best quality available, free first"
-targets = ["groq/llama-3.3-70b-versatile", "gemini/gemini-2.5-flash", "anthropic/claude-sonnet-5-5"]
+targets = ["groq/llama-3.3-70b-versatile", "gemini/gemini-flash-latest", "anthropic/claude-sonnet-5-5"]
 
 [[routes]]
 alias = "local-model"
@@ -187,7 +188,7 @@ targets = ["ollama/qwen2.5:7b", "ollama/qwen2.5-coder:3b"]
 [[routes]]
 alias = "vision-model"
 description = "Image input"
-targets = ["gemini/gemini-2.5-flash", "anthropic/claude-haiku-5-5", "openai/gpt-4o-mini"]
+targets = ["gemini/gemini-flash-latest", "anthropic/claude-haiku-5-5", "openai/gpt-4o-mini"]
 
 # Embeddings (POST /v1/embeddings). Vectors from different models cannot be
 # compared, so a route only falls back between targets with the same model id.
