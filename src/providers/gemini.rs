@@ -99,7 +99,14 @@ fn body(model: &ModelCfg, req: &ChatRequest) -> Value {
     if let Some(t) = req.top_p {
         gen_cfg["topP"] = json!(t);
     }
-    if let Some(m) = req.max_out().or(model.max_output) {
+    // Gemini counts thinking tokens against maxOutputTokens, so a small
+    // limit can be spent entirely on thinking and return no text. OpenAI
+    // callers mean "visible output" by max_tokens; leave headroom for the
+    // thinking on top, up to the model's own ceiling.
+    if let Some(requested) = req.max_out() {
+        let with_headroom = requested.saturating_mul(4).max(THINKING_HEADROOM_FLOOR);
+        gen_cfg["maxOutputTokens"] = json!(model.max_output.map_or(with_headroom, |cap| with_headroom.min(cap)));
+    } else if let Some(m) = model.max_output {
         gen_cfg["maxOutputTokens"] = json!(m);
     }
     match &req.stop {
@@ -144,6 +151,9 @@ fn request(a: &Adapter, model: &ModelCfg, method: &str, body: &Value) -> reqwest
         .header("x-goog-api-key", a.api_key().unwrap_or_default())
         .json(body)
 }
+
+/// Smallest output limit sent to Gemini when the caller sets one.
+const THINKING_HEADROOM_FLOOR: u64 = 16_384;
 
 fn finish_reason(reason: &str, has_calls: bool) -> &'static str {
     match reason {
@@ -312,7 +322,13 @@ mod tests {
         let b = body(&model, &req);
         assert_eq!(b["systemInstruction"]["parts"][0]["text"], "be brief");
         assert_eq!(b["contents"][1]["role"], "model");
-        assert_eq!(b["generationConfig"]["maxOutputTokens"], 50);
+        // max_tokens 50 is sent with headroom for thinking tokens.
+        assert_eq!(b["generationConfig"]["maxOutputTokens"], 16_384);
+        let capped = ModelCfg { max_output: Some(8_000), ..model.clone() };
+        assert_eq!(body(&capped, &req)["generationConfig"]["maxOutputTokens"], 8_000);
+        let mut big = req.clone();
+        big.max_tokens = Some(10_000);
+        assert_eq!(body(&model, &big)["generationConfig"]["maxOutputTokens"], 40_000);
         assert_eq!(b["generationConfig"]["responseMimeType"], "application/json");
     }
 }
