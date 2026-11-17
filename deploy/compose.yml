@@ -18,6 +18,26 @@ services:
       - ./aegis.nuc.toml:/app/aegis.toml:ro
       - aegis-data:/app/data
 
+  # A consistent copy of the database every 24 hours (and once at start),
+  # into ./backups next to this file, keeping the newest 14. The copies hold
+  # client-key hashes and provider keys encrypted with AEGIS_SECRET_KEY, so
+  # restoring one needs that same secret. The folder must be writable by the
+  # image's user (uid 10001): sudo install -d -o 10001 -m 700 backups
+  aegis-backup:
+    image: aegis-gateway:latest
+    container_name: aegis-backup
+    restart: unless-stopped
+    network_mode: none
+    command: ["backup", "--dir", "/backups", "--keep", "14", "--every-hours", "24"]
+    healthcheck:
+      disable: true
+    depends_on:
+      - aegis
+    volumes:
+      - ./aegis.nuc.toml:/app/aegis.toml:ro
+      - aegis-data:/app/data
+      - ./backups:/backups
+
   # Serves the embedding model and a small last-resort chat model locally.
   # After the first start, fetch them once:
   #   docker exec aegis-ollama ollama pull nomic-embed-text

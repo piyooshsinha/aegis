@@ -57,6 +57,11 @@ async fn upstream(State(m): State<Arc<Mock>>, Path(kind): Path<String>, Json(bod
             (StatusCode::TOO_MANY_REQUESTS, h, Json(json!({ "error": { "message": "slow down" } }))).into_response()
         }
         "down" => (StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response(),
+        // A host that accepts the connection and then says nothing, like a relay to a sleeping machine.
+        "stall" => {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            (StatusCode::INTERNAL_SERVER_ERROR, "too late").into_response()
+        }
         "bad" => (StatusCode::BAD_REQUEST, Json(json!({ "error": { "message": "bad parameter" } }))).into_response(),
         "midfail" => {
             let sse = "data: {\"error\":{\"message\":\"model crashed\"}}\n\n";
@@ -210,6 +215,14 @@ tier = "free"
 models = [{{ id = "m" }}]
 
 [[providers]]
+name = "stall"
+kind = "openai"
+base_url = "{up}/stall"
+tier = "local"
+first_byte_timeout_secs = 1
+models = [{{ id = "m" }}]
+
+[[providers]]
 name = "embdown"
 kind = "openai"
 base_url = "{up}/down"
@@ -233,6 +246,10 @@ models = [{{ id = "emb", context_window = 50, capabilities = ["embeddings"], inp
 [[routes]]
 alias = "embed"
 targets = ["embdown/emb", "embother/other-emb", "embed/emb"]
+
+[[routes]]
+alias = "stalled-first"
+targets = ["stall/m", "good/m"]
 
 [[routes]]
 alias = "fast"
@@ -1025,4 +1042,23 @@ async fn models_can_be_chosen_from_the_providers_list() {
     // Saving a provider key lands on that provider's model list.
     let r = post("/ui/providers/key", "provider=nokey&key=sk-test-provider-key-1234", true).send().await.unwrap();
     assert_eq!(r.headers().get("location").unwrap(), "/ui/providers/nokey/models");
+}
+
+#[tokio::test]
+async fn a_stalled_provider_is_skipped_after_its_first_byte_limit() {
+    let h = harness().await;
+    let mut req = msg("stalled-first", "hi");
+    req["stream"] = json!(true);
+    let started = std::time::Instant::now();
+    let r = h.chat(&h.key, req).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(hdr(&r, "x-aegis-provider"), "good");
+    assert_eq!(hdr(&r, "x-aegis-fallback"), "true");
+    assert!(r.text().await.unwrap().contains("Hel"));
+    // One second for the stalled host, not its 30-second silence.
+    assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let rows = h.state.db.recent_requests(5).await.unwrap();
+    let attempts: Value = serde_json::from_str(&rows[0].attempts).unwrap();
+    assert!(attempts[0]["reason"].as_str().unwrap().contains("no response within 1s"));
 }

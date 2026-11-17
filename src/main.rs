@@ -26,6 +26,18 @@ enum Command {
     },
     /// Validate the configuration file and exit.
     Check,
+    /// Write a consistent copy of the database (safe while the gateway runs).
+    Backup {
+        /// Folder for the copies.
+        #[arg(long, default_value = "data/backups")]
+        dir: String,
+        /// How many copies to keep; older ones are deleted.
+        #[arg(long, default_value_t = 14)]
+        keep: usize,
+        /// Repeat every this many hours instead of exiting (for a backup container).
+        #[arg(long)]
+        every_hours: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -68,6 +80,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Key { action } => key_command(&cfg, action).await,
+        Command::Backup { dir, keep, every_hours } => backup(&cfg, &dir, keep, every_hours).await,
         Command::Serve => serve(cfg).await,
     }
 }
@@ -103,6 +116,19 @@ async fn key_command(cfg: &Config, action: KeyAction) -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn backup(cfg: &Config, dir: &str, keep: usize, every_hours: Option<u64>) -> Result<()> {
+    let db = Db::open(&cfg.server.db_path).await?;
+    loop {
+        match db.backup(std::path::Path::new(dir), keep).await {
+            Ok((path, size)) => tracing::info!(path = %path.display(), bytes = size, keep, "database backed up"),
+            Err(e) if every_hours.is_some() => tracing::error!("backup failed: {e:#}"),
+            Err(e) => return Err(e),
+        }
+        let Some(h) = every_hours else { return Ok(()) };
+        tokio::time::sleep(std::time::Duration::from_secs(h.max(1) * 3600)).await;
+    }
 }
 
 async fn serve(cfg: Config) -> Result<()> {

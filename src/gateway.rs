@@ -716,11 +716,21 @@ pub async fn run_chat(state: Shared, ident: Arc<Identity>, opts: ChatOpts, req: 
         let fallback = idx > 0;
 
         let err = if req.stream {
-            match adapter.stream(m, &req).await {
-                // Wait for the first chunk before committing: if the provider
-                // fails here, nothing has reached the client and we can still
-                // fall back to the next target.
-                Ok((mut upstream, snap)) => match upstream.next().await {
+            // Wait for the first chunk before committing: if the provider
+            // fails here, nothing has reached the client and we can still
+            // fall back to the next target. A provider that has not produced
+            // anything within its first-byte limit counts as failed, so a
+            // stalled host costs seconds instead of the full request timeout.
+            let limit = adapter.first_byte_timeout;
+            let opened = tokio::time::timeout(limit, async {
+                let (mut upstream, snap) = adapter.stream(m, &req).await?;
+                let first = upstream.next().await;
+                Ok::<_, ProviderError>((upstream, snap, first))
+            })
+            .await
+            .unwrap_or_else(|_| Err(ProviderError::Unavailable(format!("no response within {}s", limit.as_secs()))));
+            match opened {
+                Ok((upstream, snap, first)) => match first {
                     Some(Err(e)) => e,
                     first => {
                     let first = first.and_then(Result::ok);

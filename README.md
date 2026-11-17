@@ -51,6 +51,7 @@ cargo run --release -- key create --name my-app # prints a client key once
 ```
 
 Dashboard: `http://HOST:8787/ui`. Other commands: `aegis check`,
+`aegis backup [--dir data/backups] [--keep 14] [--every-hours 24]`,
 `aegis key list`, `aegis key revoke <id>`. Keys can also be created and
 revoked in the dashboard, which takes effect immediately. The Keys page also
 breaks usage down by client key (requests, cache share, tokens, spend) over
@@ -139,6 +140,10 @@ URL to also receive each one as a JSON POST; the payload has `text` and
   paid-tier permission. Provider keys come from environment variables or are
   stored encrypted from the dashboard. The dashboard needs the admin token.
 - **Health.** Three consecutive failures open a circuit breaker with backoff.
+  A provider that cannot be reached within `connect_timeout_secs` (5 s), or
+  has not sent the first token of a streamed answer within
+  `first_byte_timeout_secs` (30 s cloud, 90 s local by default), is treated as
+  failed and the next target is tried.
 
 ## Configuration
 

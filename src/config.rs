@@ -193,14 +193,34 @@ pub struct ProviderCfg {
     #[serde(default)]
     pub api_key_env: String,
     pub tier: Tier,
+    /// Longest a whole request may take.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    /// Longest wait to open a connection. A host that is down or unreachable
+    /// is skipped after this.
+    #[serde(default = "default_connect_timeout")]
+    pub connect_timeout_secs: u64,
+    /// Longest wait for the first token of a streamed answer before falling
+    /// back to the next target. Defaults: 30 s for cloud providers, 90 s for
+    /// local ones (a cold model load plus prompt processing on a CPU).
+    #[serde(default)]
+    pub first_byte_timeout_secs: Option<u64>,
     #[serde(default)]
     pub models: Vec<ModelCfg>,
 }
 
+impl ProviderCfg {
+    pub fn first_byte_timeout(&self) -> u64 {
+        self.first_byte_timeout_secs.unwrap_or(if self.tier == Tier::Local { 90 } else { 30 }).min(self.timeout_secs.max(1))
+    }
+}
+
 fn default_timeout() -> u64 {
     120
+}
+
+fn default_connect_timeout() -> u64 {
+    5
 }
 
 #[derive(Debug, Clone, Deserialize)]

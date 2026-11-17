@@ -305,6 +305,30 @@ impl Db {
             .collect())
     }
 
+    // ---- backups --------------------------------------------------------------
+
+    /// Write a consistent copy of the whole database to `path` while it is in
+    /// use (`VACUUM INTO`), then keep only the newest `keep` copies in that
+    /// folder. Returns the copy's path and size.
+    pub async fn backup(&self, dir: &std::path::Path, keep: usize) -> Result<(std::path::PathBuf, u64)> {
+        std::fs::create_dir_all(dir)?;
+        let name = format!("aegis-{}.db", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
+        let path = dir.join(&name);
+        let target = path.to_str().ok_or_else(|| anyhow::anyhow!("backup path is not valid UTF-8"))?;
+        sqlx::query("VACUUM INTO ?").bind(target).execute(&self.pool).await?;
+        let size = std::fs::metadata(&path)?.len();
+        let mut copies: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("aegis-") && n.ends_with(".db")))
+            .collect();
+        copies.sort(); // names sort by time
+        let excess = copies.len().saturating_sub(keep.max(1));
+        for old in copies.into_iter().take(excess) {
+            std::fs::remove_file(&old)?;
+        }
+        Ok((path, size))
+    }
+
     // ---- model choices made in the dashboard -------------------------------
 
     pub async fn list_model_overrides(&self) -> Result<Vec<crate::config::ModelOverride>> {

@@ -58,6 +58,9 @@ kind = "openai"
 base_url = "http://127.0.0.1:11434/v1"
 tier = "local"
 timeout_secs = 300
+# Give up on the first token after this and try the next target, e.g. when
+# the machine running Ollama is asleep. Covers loading a model on a GPU.
+first_byte_timeout_secs = 45
 
   # Ollama loads models with a 4096-token context unless the server sets
   # OLLAMA_CONTEXT_LENGTH, and silently truncates longer prompts. Keep these
@@ -105,12 +108,20 @@ base_url = "https://generativelanguage.googleapis.com/v1beta"
 api_key_env = "GEMINI_API_KEY"
 tier = "free"
 
-  # A "-latest" alias, so it does not go stale when Google retires a version.
+  # A "-latest" alias, so it does not go stale when Google retires a version
+  # (in November 2026 it serves gemini-3.8-flash).
+  #
+  # Free tier, as AI Studio showed it for gemini-3.8-flash in late 2026:
+  # 5 requests/minute, 20 requests/day, 250k tokens/minute, per Google Cloud
+  # project (not per key); the day resets at midnight Pacific. Check yours in
+  # AI Studio. With billing enabled, raise or remove these limits and set the
+  # price: $0.75 in / $3.75 out per million tokens until 31 Dec 2026, then
+  # $1.50 / $7.50 (thinking tokens are billed as output).
   [[providers.models]]
   id = "gemini-flash-latest"
   context_window = 1048576
   capabilities = ["tools", "vision", "json"]
-  limits = { rpm = 10, rpd = 250, tpm = 250000 }
+  limits = { rpm = 5, rpd = 20, tpm = 250000 }
 
 [[providers]]
 name = "anthropic"

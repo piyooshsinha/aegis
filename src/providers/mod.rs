@@ -241,6 +241,8 @@ pub struct Adapter {
     /// Key set from the dashboard; takes precedence and can change at runtime.
     stored_key: RwLock<Option<String>>,
     pub timeout: Duration,
+    /// Longest wait for the first streamed chunk before trying the next target.
+    pub first_byte_timeout: Duration,
     pub client: reqwest::Client,
 }
 
@@ -253,7 +255,7 @@ impl Adapter {
         };
         let timeout = Duration::from_secs(p.timeout_secs.max(1));
         let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(p.connect_timeout_secs.max(1)))
             .read_timeout(timeout)
             .user_agent(concat!("aegis-gateway/", env!("CARGO_PKG_VERSION")))
             .build()?;
@@ -264,6 +266,7 @@ impl Adapter {
             env_key,
             stored_key: RwLock::new(None),
             timeout,
+            first_byte_timeout: Duration::from_secs(p.first_byte_timeout().max(1)),
             client,
         })
     }
