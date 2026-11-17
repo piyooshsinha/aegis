@@ -59,14 +59,18 @@ base_url = "http://127.0.0.1:11435/v1"
 tier = "local"
 timeout_secs = 300
 
+  # Ollama loads models with a 4096-token context unless the server sets
+  # OLLAMA_CONTEXT_LENGTH, and silently truncates longer prompts. Keep these
+  # values equal to what `ollama ps` reports so long requests are routed
+  # elsewhere instead of being cut short.
   [[providers.models]]
   id = "qwen2.5:7b"
-  context_window = 32768
+  context_window = 4096
   capabilities = ["tools", "json"]
 
   [[providers.models]]
   id = "qwen2.5-coder:3b"
-  context_window = 32768
+  context_window = 4096
   capabilities = ["json"]
 
   # Embedding model: `ollama pull nomic-embed-text` before using it.
@@ -87,10 +91,10 @@ tier = "local"
 timeout_secs = 300
 
   # Runs on the NUC's CPU: slower and less capable than the Mac's 7b model.
-  # Ollama 0.34 loads it with a 4096-token context.
+  # The container sets OLLAMA_CONTEXT_LENGTH=8192 (see compose.yml).
   [[providers.models]]
   id = "qwen2.5:3b"
-  context_window = 4096
+  context_window = 8192
   capabilities = ["tools", "json"]
 
   # Ollama loads this model with a 2048-token context and silently truncates

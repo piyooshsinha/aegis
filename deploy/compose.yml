@@ -30,6 +30,7 @@ services:
       - "127.0.0.1:11437:11434"
     environment:
       OLLAMA_KEEP_ALIVE: "-1"   # keep the model loaded instead of unloading after 5 minutes
+      OLLAMA_CONTEXT_LENGTH: "8192"   # default is 4096; keep context_window in aegis.nuc.toml in step
     volumes:
       - aegis-ollama:/root/.ollama
 
