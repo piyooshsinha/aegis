@@ -142,6 +142,79 @@ pub async fn error_from_response(resp: reqwest::Response) -> ProviderError {
     }
 }
 
+/// One entry of a provider's model list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteModel {
+    pub id: String,
+    pub context_window: Option<u64>,
+    pub kind: RemoteKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteKind {
+    Chat,
+    Embedding,
+    /// Speech, image, moderation and other models Aegis cannot route to.
+    Other,
+}
+
+async fn fetch_json(rb: reqwest::RequestBuilder) -> Result<Value, ProviderError> {
+    let resp = rb.timeout(Duration::from_secs(20)).send().await.map_err(transport_err)?;
+    if !resp.status().is_success() {
+        return Err(error_from_response(resp).await);
+    }
+    resp.json().await.map_err(transport_err)
+}
+
+/// `{ "data": [{ "id": ... }] }`, as OpenAI, Groq, Ollama and Anthropic return.
+/// These lists do not say what a model is for, so that is read from its name.
+pub fn parse_openai_models(v: &Value) -> Vec<RemoteModel> {
+    const NOT_CHAT: &[&str] = &["whisper", "tts", "dall-e", "moderation", "image", "audio", "realtime", "transcribe", "guard", "sora", "speech"];
+    v.get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|m| {
+            let id = m.get("id").and_then(Value::as_str)?.to_string();
+            let lower = id.to_lowercase();
+            let kind = if lower.contains("embed") {
+                RemoteKind::Embedding
+            } else if NOT_CHAT.iter().any(|w| lower.contains(w)) {
+                RemoteKind::Other
+            } else {
+                RemoteKind::Chat
+            };
+            let context_window = ["context_window", "max_input_tokens", "context_length"].iter().find_map(|k| m.get(*k).and_then(Value::as_u64));
+            Some(RemoteModel { id, context_window, kind })
+        })
+        .collect()
+}
+
+/// Gemini's list says which methods each model supports.
+pub fn parse_gemini_models(v: &Value) -> Vec<RemoteModel> {
+    v.get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|m| {
+            let name = m.get("name").and_then(Value::as_str)?;
+            let methods: Vec<&str> = m.get("supportedGenerationMethods").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+            let kind = if methods.contains(&"generateContent") {
+                RemoteKind::Chat
+            } else if methods.iter().any(|x| x.contains("embed")) {
+                RemoteKind::Embedding
+            } else {
+                RemoteKind::Other
+            };
+            Some(RemoteModel {
+                id: name.strip_prefix("models/").unwrap_or(name).to_string(),
+                context_window: m.get("inputTokenLimit").and_then(Value::as_u64),
+                kind,
+            })
+        })
+        .collect()
+}
+
 pub struct Embeddings {
     pub vectors: Vec<Vec<f32>>,
     /// Input tokens as reported by the provider, if it reports them.
@@ -221,6 +294,50 @@ impl Adapter {
         }
     }
 
+    /// The models this key can use, as the provider's own API lists them.
+    pub async fn list_models(&self) -> Result<Vec<RemoteModel>, ProviderError> {
+        let mut models = match self.kind {
+            ProviderKind::Openai => {
+                let mut rb = self.client.get(format!("{}/models", self.base_url));
+                if let Some(k) = self.api_key() {
+                    rb = rb.bearer_auth(k);
+                }
+                let v = fetch_json(rb).await?;
+                parse_openai_models(&v)
+            }
+            ProviderKind::Anthropic => {
+                let rb = self
+                    .client
+                    .get(format!("{}/v1/models?limit=1000", self.base_url))
+                    .header("x-api-key", self.api_key().unwrap_or_default())
+                    .header("anthropic-version", anthropic::API_VERSION);
+                let v = fetch_json(rb).await?;
+                parse_openai_models(&v)
+            }
+            ProviderKind::Gemini => {
+                let mut out = Vec::new();
+                let mut page: Option<String> = None;
+                // Follow pagination, but never loop forever on a misbehaving server.
+                for _ in 0..10 {
+                    let mut rb = self.client.get(format!("{}/models", self.base_url)).query(&[("pageSize", "1000")]).header("x-goog-api-key", self.api_key().unwrap_or_default());
+                    if let Some(p) = &page {
+                        rb = rb.query(&[("pageToken", p.as_str())]);
+                    }
+                    let v = fetch_json(rb).await?;
+                    out.extend(parse_gemini_models(&v));
+                    page = v.get("nextPageToken").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string);
+                    if page.is_none() {
+                        break;
+                    }
+                }
+                out
+            }
+        };
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        models.dedup_by(|a, b| a.id == b.id);
+        Ok(models)
+    }
+
     /// Embed each input as one vector, in order.
     pub async fn embed(&self, model: &ModelCfg, inputs: &[String], dimensions: Option<u64>) -> Result<(Embeddings, RateSnapshot), ProviderError> {
         let out = match self.kind {
@@ -252,6 +369,27 @@ impl Adapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_model_lists() {
+        let v = serde_json::json!({ "data": [
+            { "id": "llama-3.3-70b-versatile", "context_window": 131072 },
+            { "id": "text-embedding-3-small" },
+            { "id": "whisper-large-v3" },
+        ]});
+        let m = parse_openai_models(&v);
+        assert_eq!(m[0], RemoteModel { id: "llama-3.3-70b-versatile".into(), context_window: Some(131072), kind: RemoteKind::Chat });
+        assert_eq!((m[1].kind, m[2].kind), (RemoteKind::Embedding, RemoteKind::Other));
+
+        let g = serde_json::json!({ "models": [
+            { "name": "models/gemini-x-flash", "inputTokenLimit": 1048576, "supportedGenerationMethods": ["generateContent", "countTokens"] },
+            { "name": "models/embed-x", "supportedGenerationMethods": ["embedContent"] },
+            { "name": "models/aqa", "supportedGenerationMethods": ["generateAnswer"] },
+        ]});
+        let m = parse_gemini_models(&g);
+        assert_eq!(m[0], RemoteModel { id: "gemini-x-flash".into(), context_window: Some(1048576), kind: RemoteKind::Chat });
+        assert_eq!((m[1].kind, m[2].kind), (RemoteKind::Embedding, RemoteKind::Other));
+    }
 
     #[test]
     fn parses_reset_formats() {

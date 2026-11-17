@@ -101,6 +101,20 @@ async fn upstream(State(m): State<Arc<Mock>>, Path(kind): Path<String>, Json(bod
     }
 }
 
+/// The provider's own model list, as `GET /models` returns it.
+async fn upstream_models(Path(kind): Path<String>) -> Response {
+    if kind == "down" {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response();
+    }
+    Json(json!({ "object": "list", "data": [
+        { "id": "m", "context_window": 4000 },
+        { "id": "m2", "context_window": 9000 },
+        { "id": "text-embed-x" },
+        { "id": "whisper-1" },
+    ]}))
+    .into_response()
+}
+
 struct Harness {
     base: String,
     state: Shared,
@@ -128,6 +142,7 @@ async fn harness_with(extra: &str) -> Harness {
         Router::new()
             .route("/{kind}/chat/completions", post(upstream))
             .route("/{kind}/embeddings", post(upstream_embeddings))
+            .route("/{kind}/models", axum::routing::get(upstream_models))
             .with_state(mock.clone()),
     )
     .await;
@@ -798,7 +813,7 @@ async fn semantic_cache_survives_a_restart_until_purged() {
         m
     };
     let restart = || async {
-        let state = AppState::build(h.state.cfg.clone(), "admin-secret".into(), None).await.unwrap();
+        let state = AppState::build(h.state.base_cfg.clone(), "admin-secret".into(), None).await.unwrap();
         state.keys.reload(&state.db).await.unwrap();
         let base = spawn(aegis::router(state.clone())).await;
         (state, base)
@@ -863,7 +878,7 @@ async fn exact_cache_survives_a_restart_and_embedding_model_is_warmed() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let restart = || async {
-        let state = AppState::build(h.state.cfg.clone(), "admin-secret".into(), None).await.unwrap();
+        let state = AppState::build(h.state.base_cfg.clone(), "admin-secret".into(), None).await.unwrap();
         state.keys.reload(&state.db).await.unwrap();
         let base = spawn(aegis::router(state.clone())).await;
         (state, base)
@@ -918,4 +933,96 @@ async fn usage_is_broken_down_by_client_key() {
         let page = client.get(format!("{}/ui/keys{days}", h.base)).header("cookie", &cookie).send().await.unwrap().text().await.unwrap();
         assert!(page.contains("Usage by key") && page.contains("100%"), "{days}");
     }
+}
+
+#[tokio::test]
+async fn models_can_be_chosen_from_the_providers_list() {
+    let h = harness().await;
+    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let r = client.post(format!("{}/ui/login", h.base)).body("token=admin-secret").header("content-type", "application/x-www-form-urlencoded").send().await.unwrap();
+    let cookie = r.headers().get("set-cookie").unwrap().to_str().unwrap().split(';').next().unwrap().to_string();
+    let post = |path: &str, body: &str, signed_in: bool| {
+        let mut rb = client.post(format!("{}{path}", h.base)).body(body.to_string()).header("content-type", "application/x-www-form-urlencoded");
+        if signed_in {
+            rb = rb.header("cookie", &cookie);
+        }
+        rb
+    };
+    let text = |r: reqwest::Response| async move { r.text().await.unwrap() };
+    let model_of = |r: reqwest::Response| async move { r.json::<Value>().await.unwrap()["model"].as_str().unwrap_or("").to_string() };
+
+    // The page lists what the provider offers.
+    let page = text(client.get(format!("{}/ui/providers/good/models", h.base)).header("cookie", &cookie).send().await.unwrap()).await;
+    assert!(page.contains("Models in use") && page.contains("m2") && page.contains("not usable here"));
+    assert!(page.contains("lists 2 chat and 1 embedding models"));
+
+    // Not signed in: nothing changes.
+    assert_eq!(post("/ui/providers/good/models/replace", "from=m&to=m2", false).send().await.unwrap().status(), 303);
+    assert_eq!(model_of(h.chat(&h.key, msg("fast", "hi")).await).await, "m");
+
+    // Replace m with m2: routes follow, the old id is gone, the context window comes from the list.
+    let page = text(post("/ui/providers/good/models/replace", "from=m&to=m2", true).send().await.unwrap()).await;
+    assert!(page.contains("good now uses m2 in place of m"));
+    let r = h.chat(&h.key, msg("fast", "hi")).await;
+    assert_eq!(hdr(&r, "x-aegis-model"), "m2");
+    assert_eq!(model_of(r).await, "m2");
+    assert_eq!(h.chat(&h.key, msg("good/m", "hi")).await.status(), 404);
+    let cfg = h.state.cfg();
+    let good = cfg.providers.iter().find(|p| p.name == "good").unwrap();
+    assert_eq!((good.models[0].id.as_str(), good.models[0].context_window), ("m2", 9000));
+    assert!(good.models[0].has("tools"), "capabilities carry over");
+    assert!(cfg.routes.iter().find(|r| r.alias == "fast").unwrap().targets.contains(&"good/m2".to_string()));
+
+    // It survives a restart.
+    let state2 = AppState::build(h.state.base_cfg.clone(), "admin-secret".into(), None).await.unwrap();
+    assert_eq!(state2.cfg().providers.iter().find(|p| p.name == "good").unwrap().models[0].id, "m2");
+
+    // Things that must be refused.
+    let page = text(post("/ui/providers/good/models/replace", "from=m&to=whisper-1", true).send().await.unwrap()).await;
+    assert!(page.contains("not a chat or embedding model"));
+    let page = text(post("/ui/providers/good/models/replace", "from=nope&to=m2", true).send().await.unwrap()).await;
+    assert!(page.contains("has no model nope in the config file"));
+    let page = text(post("/ui/providers/good/models/add", "model=m2", true).send().await.unwrap()).await;
+    assert!(page.contains("good already has m2"));
+    let page = text(post("/ui/providers/good/models/replace", "from=m&to=has+space", true).send().await.unwrap()).await;
+    assert!(page.contains("no spaces"));
+
+    // Back to the config file's model.
+    let page = text(post("/ui/providers/good/models/restore", "from=m", true).send().await.unwrap()).await;
+    assert!(page.contains("good is back to m"));
+    assert_eq!(model_of(h.chat(&h.key, msg("fast", "hi")).await).await, "m");
+
+    // Add an extra model: callable by its id, not part of any route.
+    let page = text(post("/ui/providers/good/models/add", "model=m2&tools=on", true).send().await.unwrap()).await;
+    assert!(page.contains("Apps can now call good/m2"));
+    assert_eq!(model_of(h.chat(&h.key, msg("good/m2", "hi")).await).await, "m2");
+    assert_eq!(model_of(h.chat(&h.key, msg("fast", "hi")).await).await, "m");
+    let cfg = h.state.cfg();
+    let added = cfg.providers.iter().find(|p| p.name == "good").unwrap().models.iter().find(|m| m.id == "m2").unwrap().clone();
+    assert!(added.has("tools") && !added.has("vision") && added.context_window == 9000);
+    let listed: Value = h.http.get(format!("{}/v1/models", h.base)).bearer_auth(&h.key).send().await.unwrap().json().await.unwrap();
+    assert!(listed["data"].as_array().unwrap().iter().any(|m| m["id"] == "good/m2"));
+
+    // An embedding model is recognised from the list and serves embeddings.
+    post("/ui/providers/good/models/add", "model=text-embed-x&tools=on", true).send().await.unwrap();
+    let r = h.post("/v1/embeddings", &h.key, &[], &json!({ "model": "good/text-embed-x", "input": "hello" })).await;
+    assert_eq!(r.status(), 200);
+
+    // Only dashboard-added models can be removed here.
+    let page = text(post("/ui/providers/good/models/remove", "model=m", true).send().await.unwrap()).await;
+    assert!(page.contains("can only be changed in the config file"));
+    let page = text(post("/ui/providers/good/models/remove", "model=m2", true).send().await.unwrap()).await;
+    assert!(page.contains("Removed m2"));
+    assert_eq!(h.chat(&h.key, msg("good/m2", "hi")).await.status(), 404);
+
+    // When the provider's list cannot be fetched, a model id can still be typed.
+    let page = text(client.get(format!("{}/ui/providers/down/models", h.base)).header("cookie", &cookie).send().await.unwrap()).await;
+    assert!(page.contains("Could not fetch the model list"));
+    let page = text(post("/ui/providers/down/models/replace", "from=m&to=typed-by-hand", true).send().await.unwrap()).await;
+    assert!(page.contains("down now uses typed-by-hand"));
+    assert_eq!(client.get(format!("{}/ui/providers/nope/models", h.base)).header("cookie", &cookie).send().await.unwrap().status(), 404);
+
+    // Saving a provider key lands on that provider's model list.
+    let r = post("/ui/providers/key", "provider=nokey&key=sk-test-provider-key-1234", true).send().await.unwrap();
+    assert_eq!(r.headers().get("location").unwrap(), "/ui/providers/nokey/models");
 }

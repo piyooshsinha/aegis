@@ -13,7 +13,7 @@ use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use serde_json::{Value, json};
 
-const API_VERSION: &str = "2026-10-21";
+pub(super) const API_VERSION: &str = "2026-10-21";
 
 fn image_block(url: &str) -> Value {
     if let Some(rest) = url.strip_prefix("data:")

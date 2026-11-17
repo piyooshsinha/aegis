@@ -257,7 +257,69 @@ pub struct RouteCfg {
     pub targets: Vec<String>,
 }
 
+/// A model choice made in the dashboard, layered over the config file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelOverride {
+    pub provider: String,
+    /// The model id to send to the provider.
+    pub model: String,
+    /// `Some(id)`: use `model` in place of the config file's model `id`,
+    /// keeping its position in routes and its limits and prices.
+    /// `None`: an extra model, added to the provider.
+    pub replaces: Option<String>,
+    /// Known context window, when the provider's API reports one.
+    pub context_window: Option<u64>,
+    /// Capabilities for an added model.
+    pub capabilities: Vec<String>,
+}
+
 impl Config {
+    /// This configuration with dashboard model choices applied. Overrides
+    /// that no longer fit (unknown provider, a config model that was removed
+    /// from the file, a duplicate id) are skipped.
+    pub fn with_overrides(&self, overrides: &[ModelOverride]) -> Config {
+        let mut cfg = self.clone();
+        let mut renames: Vec<(String, String)> = Vec::new();
+        for o in overrides {
+            let Some(p) = cfg.providers.iter_mut().find(|p| p.name == o.provider) else { continue };
+            if o.model.is_empty() || p.models.iter().any(|m| m.id == o.model) {
+                continue;
+            }
+            match &o.replaces {
+                Some(old) => {
+                    let Some(m) = p.models.iter_mut().find(|m| &m.id == old) else { continue };
+                    m.id = o.model.clone();
+                    if let Some(cw) = o.context_window {
+                        m.context_window = cw;
+                    }
+                    renames.push((format!("{}/{}", p.name, old), format!("{}/{}", p.name, o.model)));
+                }
+                None => p.models.push(ModelCfg {
+                    id: o.model.clone(),
+                    context_window: o.context_window.unwrap_or_else(default_context),
+                    max_output: None,
+                    capabilities: o.capabilities.iter().filter(|c| KNOWN_CAPABILITIES.contains(&c.as_str())).cloned().collect(),
+                    input_per_mtok: 0.0,
+                    output_per_mtok: 0.0,
+                    limits: Limits::default(),
+                }),
+            }
+        }
+        for (from, to) in &renames {
+            for r in &mut cfg.routes {
+                for t in &mut r.targets {
+                    if t == from {
+                        *t = to.clone();
+                    }
+                }
+            }
+            if &cfg.cache.semantic.embedding_model == from {
+                cfg.cache.semantic.embedding_model = to.clone();
+            }
+        }
+        cfg
+    }
+
     pub fn load(path: &str) -> Result<Self> {
         let raw = std::fs::read_to_string(path).with_context(|| format!("reading config {path}"))?;
         Self::parse(&raw)

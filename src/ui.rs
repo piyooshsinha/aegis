@@ -6,7 +6,7 @@
 use crate::auth::{Identity, constant_time_eq, generate_key, hash_key, random_token};
 use crate::db::{HourBucket, RequestRecord};
 use crate::gateway::{ChatOpts, Shared, run_chat};
-use crate::providers::KeySource;
+use crate::providers::{KeySource, RemoteKind, RemoteModel};
 use crate::types::{ChatRequest, now_ms};
 use axum::extract::{Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -30,6 +30,11 @@ pub fn routes() -> Router<Shared> {
         .route("/ui/providers", get(providers))
         .route("/ui/providers/reset", post(reset_target))
         .route("/ui/providers/test", post(test_provider))
+        .route("/ui/providers/{name}/models", get(provider_models))
+        .route("/ui/providers/{name}/models/replace", post(replace_model))
+        .route("/ui/providers/{name}/models/restore", post(restore_model))
+        .route("/ui/providers/{name}/models/add", post(add_model))
+        .route("/ui/providers/{name}/models/remove", post(remove_model))
         .route("/ui/alerts", get(alerts))
         .route("/ui/alerts/test", post(test_alert))
         .route("/ui/providers/key", post(set_provider_key))
@@ -430,7 +435,7 @@ fn providers_view(state: &Shared, flash: Option<Flash>) -> Markup {
             div.table-wrap { table {
                 thead { tr { th { "Alias" } th { "Order" } th { "Purpose" } } }
                 tbody {
-                    @for r in &state.cfg.routes {
+                    @for r in &state.cfg().routes {
                         tr {
                             td.mono { (r.alias) }
                             td { @for (i, t) in r.targets.iter().enumerate() { @if i > 0 { span.arrow { " → " } } span.mono { (t) } } }
@@ -440,7 +445,7 @@ fn providers_view(state: &Shared, flash: Option<Flash>) -> Markup {
                 }
             } }
         }
-        @for p in &state.cfg.providers {
+        @for p in &state.cfg().providers {
             @let needs_key = !p.api_key_env.is_empty();
             @let source = state.adapters.get(&p.name).map_or(KeySource::Unset, |a| a.key_source());
             @let configured = !needs_key || source != KeySource::Unset;
@@ -456,11 +461,14 @@ fn providers_view(state: &Shared, flash: Option<Flash>) -> Markup {
                     @else { (badge("bad", "no API key")) }
                 }
                 p.muted { (p.kind.as_str()) " · " span.mono { (p.base_url) } }
-                @if configured && !p.models.is_empty() {
-                    form.inline method="post" action="/ui/providers/test" {
-                        input type="hidden" name="provider" value=(p.name);
-                        button.ghost.small type="submit" { "Test connection" }
+                div.row-actions {
+                    @if configured && !p.models.is_empty() {
+                        form.inline method="post" action="/ui/providers/test" {
+                            input type="hidden" name="provider" value=(p.name);
+                            button.ghost.small type="submit" { "Test connection" }
+                        }
                     }
+                    @if configured { a.button.ghost.small href=(format!("/ui/providers/{}/models", p.name)) { "Choose models" } }
                 }
                 @if needs_key {
                     @if state.sealer.is_some() {
@@ -529,7 +537,7 @@ struct ProviderKeyForm {
 async fn set_provider_key(State(state): State<Shared>, headers: HeaderMap, Form(f): Form<ProviderKeyForm>) -> Response {
     require_admin!(state, headers);
     let key = f.key.trim();
-    let needs_key = state.cfg.providers.iter().any(|p| p.name == f.provider && !p.api_key_env.is_empty());
+    let needs_key = state.cfg().providers.iter().any(|p| p.name == f.provider && !p.api_key_env.is_empty());
     let problem = if !needs_key {
         Some("That provider does not take an API key.".to_string())
     } else if key.is_empty() {
@@ -543,7 +551,8 @@ async fn set_provider_key(State(state): State<Shared>, headers: HeaderMap, Form(
         Some(e) => (StatusCode::BAD_REQUEST, providers_view(&state, Some(Err(e)))).into_response(),
         None => {
             tracing::info!(provider = %f.provider, "provider key set from dashboard");
-            Redirect::to("/ui/providers").into_response()
+            // Straight to the model list: the key decides which models exist.
+            Redirect::to(&format!("/ui/providers/{}/models", f.provider)).into_response()
         }
     }
 }
@@ -552,6 +561,202 @@ async fn test_provider(State(state): State<Shared>, headers: HeaderMap, Form(f):
     require_admin!(state, headers);
     let result = state.test_provider(&f.provider).await;
     providers_view(&state, Some(result)).into_response()
+}
+
+// ---- choosing a provider's models -------------------------------------------
+
+/// The provider's own list (or why it could not be fetched), sorted by id.
+async fn remote_models(state: &Shared, provider: &str) -> Result<Vec<RemoteModel>, String> {
+    let adapter = state.adapters.get(provider).ok_or_else(|| format!("Unknown provider {provider}."))?;
+    adapter.list_models().await.map_err(|e| e.to_string())
+}
+
+async fn models_view(state: &Shared, name: &str, flash: Option<Flash>) -> Response {
+    let cfg = state.cfg();
+    let (Some(base), Some(live)) = (state.base_cfg.providers.iter().find(|p| p.name == name), cfg.providers.iter().find(|p| p.name == name)) else {
+        return (StatusCode::NOT_FOUND, page("Models", "/ui/providers", false, html! { p.alert { "Unknown provider." } })).into_response();
+    };
+    let overrides = state.db.list_model_overrides().await.unwrap_or_default();
+    let remote = remote_models(state, name).await;
+    let chosen = |base_id: &str| overrides.iter().find(|o| o.provider == name && o.replaces.as_deref() == Some(base_id)).map(|o| o.model.clone());
+    let routes_of = |id: &str| -> Vec<&str> {
+        let key = format!("{name}/{id}");
+        cfg.routes.iter().filter(|r| r.targets.contains(&key)).map(|r| r.alias.as_str()).collect()
+    };
+    let list_id = "remote-models";
+    let body = html! {
+        p { a href="/ui/providers" { "← Providers" } }
+        (flash_view(&flash))
+        @if let Ok(list) = &remote {
+            datalist id=(list_id) { @for m in list.iter().filter(|m| m.kind != RemoteKind::Other) { option value=(m.id) {} } }
+        }
+        section.card {
+            div.card-head { h2 { (name) " " (tier_badge(live.tier.as_str())) } }
+            p.muted {
+                "Pick which of " (name) "'s models Aegis sends requests to. A replacement keeps the original's place in routes, its limits and its prices, and takes effect on the next request."
+            }
+            @match &remote {
+                Ok(list) => p.muted { (name) " lists " (int(list.iter().filter(|m| m.kind == RemoteKind::Chat).count() as i64)) " chat and " (int(list.iter().filter(|m| m.kind == RemoteKind::Embedding).count() as i64)) " embedding models for this key. Start typing in a box below to pick one." },
+                Err(e) => p.alert { "Could not fetch the model list: " (e) " You can still type a model id by hand." },
+            }
+        }
+        section.card {
+            h2 { "Models in use" }
+            div.table-wrap { table {
+                thead { tr { th { "Model" } th { "Used by routes" } th.n { "Context" } th { "Change to" } } }
+                tbody {
+                    @for b in &base.models {
+                        @let current = chosen(&b.id);
+                        @let id = current.clone().unwrap_or_else(|| b.id.clone());
+                        @let live_m = live.models.iter().find(|m| m.id == id);
+                        @let listed = remote.as_ref().ok().map(|l| l.iter().any(|m| m.id == id));
+                        tr {
+                            td {
+                                div.mono.strong { (id) }
+                                @if current.is_some() { div.muted { "in place of " span.mono { (b.id) } " from the config file" } }
+                                @if listed == Some(false) { div.err-text { "Not in " (name) "'s list for this key" } }
+                                @for c in &b.capabilities { (badge("plain", c)) " " }
+                            }
+                            td { @let rs = routes_of(&id); @if rs.is_empty() { span.muted { "none (call it as " span.mono { (name) "/" (id) } ")" } } @else { span.mono { (rs.join(", ")) } } }
+                            td.n { (live_m.map(|m| compact(m.context_window)).unwrap_or_default()) }
+                            td {
+                                form.pick method="post" action=(format!("/ui/providers/{name}/models/replace")) {
+                                    input type="hidden" name="from" value=(b.id);
+                                    input type="text" name="to" list=(list_id) placeholder="model id" required autocomplete="off" spellcheck="false";
+                                    button.small type="submit" { "Use this" }
+                                }
+                                @if current.is_some() {
+                                    form.inline method="post" action=(format!("/ui/providers/{name}/models/restore")) {
+                                        input type="hidden" name="from" value=(b.id);
+                                        button.ghost.small type="submit" { "Back to " (b.id) }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    @for o in overrides.iter().filter(|o| o.provider == name && o.replaces.is_none()) {
+                        tr {
+                            td {
+                                div.mono.strong { (o.model) }
+                                div.muted { "added here" }
+                                @for c in &o.capabilities { (badge("plain", c)) " " }
+                            }
+                            td { span.muted { "none (call it as " span.mono { (name) "/" (o.model) } ")" } }
+                            td.n { (live.models.iter().find(|m| m.id == o.model).map(|m| compact(m.context_window)).unwrap_or_default()) }
+                            td {
+                                form.inline method="post" action=(format!("/ui/providers/{name}/models/remove")) {
+                                    input type="hidden" name="model" value=(o.model);
+                                    button.ghost.small.danger type="submit" { "Remove" }
+                                }
+                            }
+                        }
+                    }
+                }
+            } }
+        }
+        section.card {
+            h2 { "Add another model" }
+            p.muted { "An added model is not part of any route. Apps reach it by its full id, " span.mono { (name) "/model-id" } ". It has no price or rate limit set, so its spend shows as $0." }
+            form method="post" action=(format!("/ui/providers/{name}/models/add")) {
+                div.pick {
+                    input type="text" name="model" list=(list_id) placeholder="model id" required autocomplete="off" spellcheck="false";
+                    button.primary type="submit" { "Add model" }
+                }
+                div.checks {
+                    span.muted { "It supports:" }
+                    label { input type="checkbox" name="tools"; " tool calls" }
+                    label { input type="checkbox" name="vision"; " image input" }
+                    label { input type="checkbox" name="json"; " JSON output" }
+                }
+                p.muted { "Embedding models are recognised from the provider's list. Requests that need a feature you did not tick skip this model." }
+            }
+        }
+        @if let Ok(list) = &remote {
+            section.card {
+                h2 { "Everything " (name) " offers this key" }
+                div.table-wrap { table {
+                    thead { tr { th { "Model id" } th { "Type" } th.n { "Context" } th {} } }
+                    tbody {
+                        @for m in list {
+                            tr {
+                                td.mono { (m.id) }
+                                td { (match m.kind { RemoteKind::Chat => "chat", RemoteKind::Embedding => "embedding", RemoteKind::Other => "other (not usable here)" }) }
+                                td.n { (m.context_window.map(compact).unwrap_or_else(|| "–".into())) }
+                                td { @if live.models.iter().any(|x| x.id == m.id) { (badge("ok", "in use")) } }
+                            }
+                        }
+                    }
+                } }
+            }
+        }
+    };
+    page(&format!("{name} models"), "/ui/providers", false, body).into_response()
+}
+
+async fn provider_models(State(state): State<Shared>, headers: HeaderMap, Path(name): Path<String>) -> Response {
+    require_admin!(state, headers);
+    models_view(&state, &name, None).await
+}
+
+#[derive(Deserialize)]
+struct ModelForm {
+    #[serde(default)]
+    from: String,
+    #[serde(default)]
+    to: String,
+    #[serde(default)]
+    model: String,
+    tools: Option<String>,
+    vision: Option<String>,
+    json: Option<String>,
+}
+
+/// What the provider's list says about a model, if it could be fetched.
+async fn remote_info(state: &Shared, provider: &str, model: &str) -> Option<RemoteModel> {
+    remote_models(state, provider).await.ok()?.into_iter().find(|m| m.id == model)
+}
+
+async fn replace_model(State(state): State<Shared>, headers: HeaderMap, Path(name): Path<String>, Form(f): Form<ModelForm>) -> Response {
+    require_admin!(state, headers);
+    let to = f.to.trim().to_string();
+    let info = remote_info(&state, &name, &to).await;
+    let result = match &info {
+        Some(m) if m.kind == RemoteKind::Other => Err(format!("{to} is not a chat or embedding model.")),
+        _ => state.choose_model(&name, Some(&f.from), &to, info.as_ref().and_then(|m| m.context_window), Vec::new()).await,
+    };
+    let flash = result.map(|()| format!("{name} now uses {to} in place of {}. Press Test connection on the Providers page to check it.", f.from));
+    models_view(&state, &name, Some(flash)).await
+}
+
+async fn restore_model(State(state): State<Shared>, headers: HeaderMap, Path(name): Path<String>, Form(f): Form<ModelForm>) -> Response {
+    require_admin!(state, headers);
+    let flash = state.restore_model(&name, &f.from).await.map(|()| format!("{name} is back to {} from the config file.", f.from));
+    models_view(&state, &name, Some(flash)).await
+}
+
+async fn add_model(State(state): State<Shared>, headers: HeaderMap, Path(name): Path<String>, Form(f): Form<ModelForm>) -> Response {
+    require_admin!(state, headers);
+    let model = f.model.trim().to_string();
+    let info = remote_info(&state, &name, &model).await;
+    let result = match &info {
+        Some(m) if m.kind == RemoteKind::Other => Err(format!("{model} is not a chat or embedding model.")),
+        _ => {
+            let caps: Vec<String> = if info.as_ref().is_some_and(|m| m.kind == RemoteKind::Embedding) {
+                vec!["embeddings".into()]
+            } else {
+                [("tools", &f.tools), ("vision", &f.vision), ("json", &f.json)].into_iter().filter(|(_, v)| v.is_some()).map(|(c, _)| c.to_string()).collect()
+            };
+            state.choose_model(&name, None, &model, info.as_ref().and_then(|m| m.context_window), caps).await
+        }
+    };
+    let flash = result.map(|()| format!("Added. Apps can now call {name}/{model}."));
+    models_view(&state, &name, Some(flash)).await
+}
+
+async fn remove_model(State(state): State<Shared>, headers: HeaderMap, Path(name): Path<String>, Form(f): Form<ModelForm>) -> Response {
+    require_admin!(state, headers);
+    let flash = state.remove_added_model(&name, &f.model).await.map(|()| format!("Removed {}.", f.model));
+    models_view(&state, &name, Some(flash)).await
 }
 
 async fn remove_provider_key(State(state): State<Shared>, headers: HeaderMap, Form(f): Form<ProviderKeyForm>) -> Response {
@@ -572,7 +777,7 @@ struct ResetForm {
 
 async fn reset_target(State(state): State<Shared>, headers: HeaderMap, Form(f): Form<ResetForm>) -> Response {
     require_admin!(state, headers);
-    if state.cfg.find_target(&f.target).is_some() {
+    if state.cfg().find_target(&f.target).is_some() {
         state.quota.reset(&f.target);
     }
     Redirect::to("/ui/providers").into_response()
@@ -880,9 +1085,9 @@ async fn playground(State(state): State<Shared>, headers: HeaderMap) -> Response
                 form #play-form {
                     label { span { "Model" }
                         select name="model" {
-                            optgroup label="Routes" { @for r in &state.cfg.routes { option value=(r.alias) { (r.alias) } } }
+                            optgroup label="Routes" { @for r in &state.cfg().routes { option value=(r.alias) { (r.alias) } } }
                             optgroup label="Direct" {
-                                @for p in &state.cfg.providers { @for m in &p.models { option value=(format!("{}/{}", p.name, m.id)) { (p.name) "/" (m.id) } } }
+                                @for p in &state.cfg().providers { @for m in &p.models { option value=(format!("{}/{}", p.name, m.id)) { (p.name) "/" (m.id) } } }
                             }
                         }
                     }
@@ -1008,6 +1213,13 @@ button.ghost{background:transparent;color:var(--muted)}
 button.small{padding:3px 9px;font-size:12.5px}
 button:disabled{opacity:.6;cursor:progress}
 form.inline{display:inline}
+.row-actions{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0}
+a.button{display:inline-block;text-decoration:none;border:1px solid var(--line);border-radius:8px;color:var(--ink)}
+a.button.small{padding:3px 9px;font-size:12.5px}
+.pick{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.pick input[type=text]{min-width:220px;flex:1 1 220px}
+.checks{display:flex;gap:14px;flex-wrap:wrap;margin:8px 0}
+.checks label{display:inline-flex;gap:6px;align-items:center;margin:0}
 .keybox{margin:8px 0 14px}
 .keybox summary{cursor:pointer;color:var(--accent);font-weight:600;font-size:13.5px}
 .key-row{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}

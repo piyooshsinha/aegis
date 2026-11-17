@@ -153,6 +153,14 @@ const SCHEMA: &[&str] = &[
         error TEXT NOT NULL
     )",
     "CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts)",
+    "CREATE TABLE IF NOT EXISTS model_overrides (
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        replaces TEXT,
+        context_window INTEGER,
+        capabilities TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (provider, model)
+    )",
     "CREATE TABLE IF NOT EXISTS response_cache (
         key TEXT PRIMARY KEY,
         entry TEXT NOT NULL,
@@ -295,6 +303,54 @@ impl Db {
                 updated_at: r.get("updated_at"),
             })
             .collect())
+    }
+
+    // ---- model choices made in the dashboard -------------------------------
+
+    pub async fn list_model_overrides(&self) -> Result<Vec<crate::config::ModelOverride>> {
+        let rows = sqlx::query("SELECT provider, model, replaces, context_window, capabilities FROM model_overrides ORDER BY rowid")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let caps: String = r.get("capabilities");
+                crate::config::ModelOverride {
+                    provider: r.get("provider"),
+                    model: r.get("model"),
+                    replaces: r.get("replaces"),
+                    context_window: r.get::<Option<i64>, _>("context_window").and_then(|v| u64::try_from(v).ok()),
+                    capabilities: caps.split(',').filter(|c| !c.is_empty()).map(str::to_string).collect(),
+                }
+            })
+            .collect())
+    }
+
+    /// Save a model choice. A replacement supersedes any earlier replacement
+    /// of the same config model.
+    pub async fn put_model_override(&self, o: &crate::config::ModelOverride) -> Result<()> {
+        if let Some(old) = &o.replaces {
+            sqlx::query("DELETE FROM model_overrides WHERE provider = ? AND replaces = ?").bind(&o.provider).bind(old).execute(&self.pool).await?;
+        }
+        sqlx::query("INSERT OR REPLACE INTO model_overrides (provider, model, replaces, context_window, capabilities) VALUES (?, ?, ?, ?, ?)")
+            .bind(&o.provider)
+            .bind(&o.model)
+            .bind(&o.replaces)
+            .bind(o.context_window.map(|v| v as i64))
+            .bind(o.capabilities.join(","))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Remove the replacement of a config model (`replaces = Some`) or an
+    /// added model (`replaces = None`).
+    pub async fn delete_model_override(&self, provider: &str, model: &str, replaces: Option<&str>) -> Result<bool> {
+        let res = match replaces {
+            Some(old) => sqlx::query("DELETE FROM model_overrides WHERE provider = ? AND replaces = ?").bind(provider).bind(old).execute(&self.pool).await?,
+            None => sqlx::query("DELETE FROM model_overrides WHERE provider = ? AND model = ? AND replaces IS NULL").bind(provider).bind(model).execute(&self.pool).await?,
+        };
+        Ok(res.rows_affected() > 0)
     }
 
     // ---- exact-match cache -------------------------------------------------

@@ -4,7 +4,7 @@
 use crate::auth::{Identity, KeyStore, presented_key};
 use crate::alerts::Alerts;
 use crate::cache::{CacheMode, CachedEntry, ResponseCache, SemanticIndex};
-use crate::config::{Config, ModelCfg, ProviderCfg, Tier};
+use crate::config::{Config, ModelCfg, ModelOverride, ProviderCfg, Tier};
 use crate::db::{Db, RequestRecord};
 use crate::providers::{Adapter, ChunkStream, ProviderError, RateSnapshot};
 use crate::quota::QuotaTracker;
@@ -19,12 +19,16 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
 pub struct AppState {
-    pub cfg: Config,
+    /// The configuration as loaded from the file.
+    pub base_cfg: Config,
+    /// `base_cfg` with the dashboard's model choices applied. Swapped whole
+    /// when those change; read it through [`AppState::cfg`].
+    live_cfg: RwLock<Arc<Config>>,
     pub adapters: HashMap<String, Adapter>,
     pub quota: QuotaTracker,
     pub cache: ResponseCache,
@@ -46,6 +50,8 @@ pub type Shared = Arc<AppState>;
 
 #[derive(Debug, Clone)]
 pub struct Target {
+    /// The configuration snapshot the indices below point into.
+    cfg: Arc<Config>,
     pub provider: usize,
     pub model: usize,
     pub key: String,
@@ -110,8 +116,11 @@ impl AppState {
         }
         let webhook = std::env::var(&cfg.alerts.webhook_url_env).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
         let alerts = Alerts::new(&cfg.alerts, webhook);
+        let overrides = db.list_model_overrides().await?;
+        let live_cfg = RwLock::new(Arc::new(cfg.with_overrides(&overrides)));
         let state = Arc::new(Self {
-            cfg,
+            base_cfg: cfg,
+            live_cfg,
             adapters,
             quota,
             cache,
@@ -129,11 +138,11 @@ impl AppState {
 
         // A cold embedding model can take longer to load than a lookup is
         // allowed to wait, so load it now rather than on the first request.
-        if state.cfg.cache.enabled && state.cfg.cache.semantic.enabled {
+        if state.base_cfg.cache.enabled && state.base_cfg.cache.semantic.enabled {
             let warm = state.clone();
             tokio::spawn(async move {
                 warm.warm_embedding_model().await;
-                let every = warm.cfg.cache.semantic.keep_warm_secs;
+                let every = warm.base_cfg.cache.semantic.keep_warm_secs;
                 if every > 0 {
                     let mut tick = tokio::time::interval(Duration::from_secs(every.max(10)));
                     tick.tick().await;
@@ -150,7 +159,7 @@ impl AppState {
     /// One throwaway embedding, with a generous timeout, to get the model
     /// loaded. Returns whether it answered.
     pub async fn warm_embedding_model(&self) -> bool {
-        let Some(t) = self.target(&self.semantic.cfg().embedding_model) else { return false };
+        let Some(t) = self.target(&self.cfg().cache.semantic.embedding_model) else { return false };
         let (p, m) = self.parts(&t);
         let Some(adapter) = self.adapters.get(&p.name) else { return false };
         if !p.api_key_env.is_empty() && adapter.api_key().is_none() {
@@ -174,29 +183,95 @@ impl AppState {
         }
     }
 
-    pub fn target(&self, key: &str) -> Option<Target> {
-        self.cfg.find_target(key).map(|(provider, model)| Target { provider, model, key: key.to_string() })
+    /// The configuration in force right now.
+    pub fn cfg(&self) -> Arc<Config> {
+        self.live_cfg.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    pub fn parts(&self, t: &Target) -> (&ProviderCfg, &ModelCfg) {
-        let p = &self.cfg.providers[t.provider];
+    fn target_in(cfg: &Arc<Config>, key: &str) -> Option<Target> {
+        cfg.find_target(key).map(|(provider, model)| Target { cfg: cfg.clone(), provider, model, key: key.to_string() })
+    }
+
+    pub fn target(&self, key: &str) -> Option<Target> {
+        Self::target_in(&self.cfg(), key)
+    }
+
+    pub fn parts<'a>(&self, t: &'a Target) -> (&'a ProviderCfg, &'a ModelCfg) {
+        let p = &t.cfg.providers[t.provider];
         (p, &p.models[t.model])
+    }
+
+    /// Use `model` for a provider: in place of the config file's model
+    /// `replaces`, or as an extra model when `replaces` is `None`. Takes
+    /// effect for the next request.
+    pub async fn choose_model(&self, provider: &str, replaces: Option<&str>, model: &str, context_window: Option<u64>, capabilities: Vec<String>) -> Result<(), String> {
+        let model = model.trim();
+        let base = self.base_cfg.providers.iter().find(|p| p.name == provider).ok_or_else(|| format!("Unknown provider {provider}."))?;
+        if model.is_empty() || model.len() > 200 || !model.chars().all(|c| c.is_ascii_graphic()) {
+            return Err("A model id is 1 to 200 characters with no spaces.".into());
+        }
+        if let Some(old) = replaces {
+            if !base.models.iter().any(|m| m.id == old) {
+                return Err(format!("{provider} has no model {old} in the config file."));
+            }
+            if model == old {
+                return self.restore_model(provider, old).await;
+            }
+        }
+        // The id must not collide with another model of this provider. The
+        // slot being replaced is allowed to change to anything else.
+        let overrides = self.db.list_model_overrides().await.map_err(|e| e.to_string())?;
+        let occupying = replaces.and_then(|old| overrides.iter().find(|o| o.provider == provider && o.replaces.as_deref() == Some(old)).map(|o| o.model.clone()));
+        let live = self.cfg();
+        let taken = live.providers.iter().find(|p| p.name == provider).is_some_and(|p| p.models.iter().any(|m| m.id == model));
+        if taken && occupying.as_deref() != Some(model) {
+            return Err(format!("{provider} already has {model}."));
+        }
+        let o = ModelOverride { provider: provider.to_string(), model: model.to_string(), replaces: replaces.map(str::to_string), context_window, capabilities };
+        self.db.put_model_override(&o).await.map_err(|e| e.to_string())?;
+        self.reload_model_overrides().await.map_err(|e| e.to_string())?;
+        self.quota.reset(&format!("{provider}/{model}"));
+        tracing::info!(provider, model, replaces = replaces.unwrap_or("-"), "model chosen from dashboard");
+        Ok(())
+    }
+
+    /// Go back to the config file's model `base_id`.
+    pub async fn restore_model(&self, provider: &str, base_id: &str) -> Result<(), String> {
+        self.db.delete_model_override(provider, "", Some(base_id)).await.map_err(|e| e.to_string())?;
+        self.reload_model_overrides().await.map_err(|e| e.to_string())
+    }
+
+    /// Remove a model that was added from the dashboard.
+    pub async fn remove_added_model(&self, provider: &str, model: &str) -> Result<(), String> {
+        let removed = self.db.delete_model_override(provider, model, None).await.map_err(|e| e.to_string())?;
+        if !removed {
+            return Err(format!("{model} was not added from the dashboard, so it can only be changed in the config file."));
+        }
+        self.reload_model_overrides().await.map_err(|e| e.to_string())
+    }
+
+    /// Re-read the dashboard's model choices and put them into force.
+    pub async fn reload_model_overrides(&self) -> anyhow::Result<()> {
+        let overrides = self.db.list_model_overrides().await?;
+        let cfg = Arc::new(self.base_cfg.with_overrides(&overrides));
+        *self.live_cfg.write().unwrap_or_else(|e| e.into_inner()) = cfg;
+        Ok(())
     }
 
     /// A model name is, in order: a route alias, an explicit `provider/model`,
     /// or a bare model id served by one or more providers.
     pub fn resolve(&self, model: &str) -> Vec<Target> {
-        if let Some(route) = self.cfg.routes.iter().find(|r| r.alias == model) {
-            return route.targets.iter().filter_map(|t| self.target(t)).collect();
+        let cfg = self.cfg();
+        if let Some(route) = cfg.routes.iter().find(|r| r.alias == model) {
+            return route.targets.iter().filter_map(|t| Self::target_in(&cfg, t)).collect();
         }
-        if let Some(t) = self.target(model) {
+        if let Some(t) = Self::target_in(&cfg, model) {
             return vec![t];
         }
-        self.cfg
-            .providers
+        cfg.providers
             .iter()
             .filter(|p| p.models.iter().any(|m| m.id == model))
-            .filter_map(|p| self.target(&format!("{}/{}", p.name, model)))
+            .filter_map(|p| Self::target_in(&cfg, &format!("{}/{}", p.name, model)))
             .collect()
     }
 
@@ -225,7 +300,8 @@ impl AppState {
 
     /// A new key deserves a fresh start: drop cooldowns earned by the old one.
     fn clear_provider_state(&self, provider: &str) {
-        if let Some(p) = self.cfg.providers.iter().find(|p| p.name == provider) {
+        let cfg = self.cfg();
+        if let Some(p) = cfg.providers.iter().find(|p| p.name == provider) {
             for m in &p.models {
                 self.quota.reset(&format!("{}/{}", p.name, m.id));
             }
@@ -277,8 +353,9 @@ impl AppState {
     async fn semantic_store(&self, partition: String, vector: Vec<f32>, entry: CachedEntry) {
         let json = serde_json::to_string(&entry).unwrap_or_default();
         let Some((unit, expires_ms)) = self.semantic.insert(partition.clone(), vector, entry) else { return };
-        let cfg = self.semantic.cfg();
-        if let Err(e) = self.db.insert_semantic(&cfg.embedding_model, &partition, &unit, &json, expires_ms, cfg.max_entries).await {
+        let cfg = self.cfg();
+        let sem = &cfg.cache.semantic;
+        if let Err(e) = self.db.insert_semantic(&sem.embedding_model, &partition, &unit, &json, expires_ms, sem.max_entries).await {
             tracing::warn!("semantic cache entry not saved: {e}");
         }
     }
@@ -298,7 +375,8 @@ impl AppState {
     /// Embed one text with the semantic cache's embedding model. Failure is
     /// never fatal: the request simply goes upstream.
     async fn embed_for_cache(&self, text: &str) -> Option<Vec<f32>> {
-        let sem = self.semantic.cfg();
+        let cfg = self.cfg();
+        let sem = &cfg.cache.semantic;
         let t = self.target(&sem.embedding_model)?;
         let (p, m) = self.parts(&t);
         let adapter = self.adapters.get(&p.name)?;
@@ -334,7 +412,8 @@ impl AppState {
     /// Send one tiny request to a provider to check its key and reachability.
     /// Returns a sentence for the operator either way.
     pub async fn test_provider(&self, provider: &str) -> Result<String, String> {
-        let p = self.cfg.providers.iter().find(|p| p.name == provider).ok_or_else(|| format!("Unknown provider {provider}."))?;
+        let cfg = self.cfg();
+        let p = cfg.providers.iter().find(|p| p.name == provider).ok_or_else(|| format!("Unknown provider {provider}."))?;
         let adapter = self.adapters.get(&p.name).ok_or_else(|| format!("Unknown provider {provider}."))?;
         if !p.api_key_env.is_empty() && adapter.api_key().is_none() {
             return Err(format!("{provider} has no API key yet."));
@@ -454,7 +533,7 @@ fn identify(state: &AppState, headers: &HeaderMap) -> Result<Arc<Identity>, Resp
             .keys
             .authenticate(&k)
             .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "invalid_api_key", "Invalid or revoked API key.")),
-        None if !state.cfg.auth.required => Ok(Arc::new(Identity::anonymous())),
+        None if !state.cfg().auth.required => Ok(Arc::new(Identity::anonymous())),
         None => Err(api_error(
             StatusCode::UNAUTHORIZED,
             "missing_api_key",
@@ -481,12 +560,12 @@ pub async fn list_models(State(state): State<Shared>, headers: HeaderMap) -> Res
         Err(r) => return r,
     };
     let mut data = Vec::new();
-    for r in &state.cfg.routes {
+    for r in &state.cfg().routes {
         if ident.may_use(&r.alias) {
             data.push(json!({ "id": r.alias, "object": "model", "owned_by": "aegis", "description": r.description, "targets": r.targets }));
         }
     }
-    for p in &state.cfg.providers {
+    for p in &state.cfg().providers {
         for m in &p.models {
             let id = format!("{}/{}", p.name, m.id);
             if ident.may_use(&id) {
@@ -501,7 +580,7 @@ pub async fn list_models(State(state): State<Shared>, headers: HeaderMap) -> Res
 }
 
 pub async fn healthz(State(state): State<Shared>) -> Response {
-    Json(json!({ "status": "ok", "uptime_secs": state.started.elapsed().as_secs(), "providers": state.cfg.providers.len() })).into_response()
+    Json(json!({ "status": "ok", "uptime_secs": state.started.elapsed().as_secs(), "providers": state.cfg().providers.len() })).into_response()
 }
 
 // ---- pipeline -------------------------------------------------------------

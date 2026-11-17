@@ -70,6 +70,22 @@ There are two ways to give a provider its key:
 "Test connection" on the same page sends one tiny request and says whether
 the provider accepted the key.
 
+### Choosing models
+
+Model ids go out of date. "Choose models" on a provider (also where you land
+after saving its key) shows the models the provider's own API lists for your
+key and lets you:
+
+- **replace** a model from the config file with another one. The replacement
+  keeps the original's place in routes, its limits and its prices, so aliases
+  such as `smart-model` keep working;
+- **add** an extra model, reachable as `provider/model-id` but not part of any
+  route;
+- go **back** to the config file's model at any time.
+
+Choices are stored in SQLite, take effect on the next request and survive
+restarts. The config file stays the place for prices, rate limits and routes.
+
 A key saved in the dashboard takes precedence over the environment. Keep
 `AEGIS_SECRET_KEY` unchanged: keys saved under a different value cannot be
 decrypted and must be entered again.
