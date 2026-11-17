@@ -395,18 +395,6 @@ async fn requests(State(state): State<Shared>, headers: HeaderMap) -> Response {
 
 // ---- providers ------------------------------------------------------------
 
-fn meter(label: &str, used: u64, limit: Option<u64>) -> Markup {
-    html! {
-        div.meter {
-            div.meter-head { span { (label) } span.mono { (compact(used)) " / " (limit.map(compact).unwrap_or_else(|| "∞".into())) } }
-            @if let Some(l) = limit {
-                @let p = if l == 0 { 100.0 } else { (used as f64 / l as f64 * 100.0).min(100.0) };
-                div.track { div class={ "fill" @if p >= 90.0 { " hot" } @else if p >= 70.0 { " warm" } } style=(format!("width:{p:.1}%")) {} }
-            }
-        }
-    }
-}
-
 async fn providers(State(state): State<Shared>, headers: HeaderMap) -> Response {
     require_admin!(state, headers);
     providers_view(&state, None).into_response()
@@ -425,100 +413,250 @@ fn flash_view(flash: &Option<Flash>) -> Markup {
     }
 }
 
+/// Logo class and path for a provider, recognised from its name, kind and URL.
+fn brand(p: &crate::config::ProviderCfg) -> (&'static str, Option<&'static str>) {
+    use crate::config::ProviderKind;
+    let hay = format!("{} {}", p.name, p.base_url).to_lowercase();
+    if hay.contains("ollama") || hay.contains(":11434") {
+        ("b-ollama", Some(crate::icons::OLLAMA))
+    } else if hay.contains("groq") {
+        ("b-groq", None)
+    } else if p.kind == ProviderKind::Gemini || hay.contains("googleapis") {
+        ("b-gemini", Some(crate::icons::GEMINI))
+    } else if p.kind == ProviderKind::Anthropic || hay.contains("anthropic") {
+        ("b-anthropic", Some(crate::icons::ANTHROPIC))
+    } else if hay.contains("openai") {
+        ("b-openai", Some(crate::icons::OPENAI))
+    } else {
+        ("b-other", None)
+    }
+}
+
+fn provider_icon(p: &crate::config::ProviderCfg, small: bool) -> Markup {
+    let (class, path) = brand(p);
+    html! {
+        span class={ "picon " (class) @if small { " sm" } } aria-hidden="true" {
+            @if let Some(d) = path { svg viewBox="0 0 24 24" { path d=(d) {} } }
+            @else { (p.name.chars().next().map(|c| c.to_ascii_uppercase()).unwrap_or('?')) }
+        }
+    }
+}
+
+/// Whether a target can take a request right now, as far as the gateway knows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Readiness {
+    Ready,
+    Cooling,
+    NoKey,
+}
+
+impl Readiness {
+    fn class(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Cooling => "cooling",
+            Self::NoKey => "nokey",
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Cooling => "cooling down",
+            Self::NoKey => "no API key",
+        }
+    }
+}
+
+/// One model's limits as compact bars; only limits that are set are drawn.
+fn usage_view(v: &crate::quota::TargetView, l: &crate::config::Limits) -> Markup {
+    let bars = [("req / min", v.rpm_used, l.rpm), ("req / day", v.rpd_used, l.rpd), ("tok / min", v.tpm_used, l.tpm), ("tok / day", v.tpd_used, l.tpd)];
+    html! {
+        @if bars.iter().all(|b| b.2.is_none()) {
+            span.muted.small { "No limits set · " (compact(v.rpd_used)) " requests, " (compact(v.tpd_used)) " tokens today" }
+        } @else {
+            div.minis {
+                @for (label, used, limit) in bars {
+                    @if let Some(lim) = limit {
+                        @let p = if lim == 0 { 100.0 } else { (used as f64 / lim as f64 * 100.0).min(100.0) };
+                        div.mini title=(format!("{} of {} {}", int(used as i64), int(lim as i64), label)) {
+                            div.mini-head { span { (label) } span.mono { (compact(used)) "/" (compact(lim)) } }
+                            div.track { div class={ "fill" @if p >= 90.0 { " hot" } @else if p >= 70.0 { " warm" } } style=(format!("width:{p:.1}%")) {} }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn providers_view(state: &Shared, flash: Option<Flash>) -> Markup {
+    use std::collections::HashMap;
+    let cfg = state.cfg();
     let stored = state.stored_keys.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+    // Work out every target's state once; the summary, routes and panels share it.
+    let mut ready_of: HashMap<String, Readiness> = HashMap::new();
+    let mut views: HashMap<String, crate::quota::TargetView> = HashMap::new();
+    let mut configured_of: HashMap<&str, (bool, KeySource)> = HashMap::new();
+    for p in &cfg.providers {
+        let needs_key = !p.api_key_env.is_empty();
+        let source = state.adapters.get(&p.name).map_or(KeySource::Unset, |a| a.key_source());
+        let configured = !needs_key || source != KeySource::Unset;
+        configured_of.insert(p.name.as_str(), (configured, source));
+        for m in &p.models {
+            let key = format!("{}/{}", p.name, m.id);
+            let v = state.quota.view(&key);
+            let r = if !configured { Readiness::NoKey } else if v.cooldown_secs > 0 { Readiness::Cooling } else { Readiness::Ready };
+            ready_of.insert(key.clone(), r);
+            views.insert(key, v);
+        }
+    }
+    let count = |r: Readiness| ready_of.values().filter(|x| **x == r).count() as i64;
+    let providers_ready = configured_of.values().filter(|c| c.0).count() as i64;
+    let dead_routes = cfg.routes.iter().filter(|r| !r.targets.iter().any(|t| ready_of.get(t) == Some(&Readiness::Ready))).count() as i64;
+    let provider_by_name: HashMap<&str, &crate::config::ProviderCfg> = cfg.providers.iter().map(|p| (p.name.as_str(), p)).collect();
+
     let body = html! {
         (flash_view(&flash))
-        section.card {
-            h2 { "Routes" }
-            p.muted { "A request for an alias goes to the first target that is configured, capable of the request, and within quota." }
-            div.table-wrap { table {
-                thead { tr { th { "Alias" } th { "Order" } th { "Purpose" } } }
-                tbody {
-                    @for r in &state.cfg().routes {
-                        tr {
-                            td.mono { (r.alias) }
-                            td { @for (i, t) in r.targets.iter().enumerate() { @if i > 0 { span.arrow { " → " } } span.mono { (t) } } }
-                            td.muted { (r.description) }
-                        }
-                    }
-                }
-            } }
+        section.tiles {
+            div.tile { span.k { "Providers ready" } span.v { (providers_ready) span.of { " / " (cfg.providers.len()) } } span.sub { "have a key or need none" } }
+            div.tile { span.k { "Models ready" } span.v { (count(Readiness::Ready)) span.of { " / " (ready_of.len()) } } span.sub { (count(Readiness::NoKey)) " waiting for a key" } }
+            div.tile { span.k { "Cooling down" } span.v.warnv[count(Readiness::Cooling) > 0] { (count(Readiness::Cooling)) } span.sub { "rate limited or failing" } }
+            div.tile { span.k { "Routes" } span.v { (cfg.routes.len()) } span.sub { @if dead_routes == 0 { "all have a ready target" } @else { (dead_routes) " with no ready target" } } }
         }
-        @for p in &state.cfg().providers {
-            @let needs_key = !p.api_key_env.is_empty();
-            @let source = state.adapters.get(&p.name).map_or(KeySource::Unset, |a| a.key_source());
-            @let configured = !needs_key || source != KeySource::Unset;
-            section.card {
-                div.card-head {
-                    h2 { (p.name) " " (tier_badge(p.tier.as_str())) }
-                    @if !needs_key { (badge("ok", "no key needed")) }
-                    @else if source == KeySource::Dashboard {
-                        @let hint = stored.get(&p.name).map(|s| s.0.as_str()).unwrap_or("");
-                        (badge("ok", &if hint.is_empty() { "key saved here".to_string() } else { format!("key saved here ····{hint}") }))
-                    }
-                    @else if source == KeySource::Env { (badge("ok", &format!("key from {}", p.api_key_env))) }
-                    @else { (badge("bad", "no API key")) }
+
+        section.card {
+            div.card-head {
+                h2 { "Routes" }
+                div.legend-row {
+                    span.lg { span.dot.ready {} "ready" }
+                    span.lg { span.dot.cooling {} "cooling down" }
+                    span.lg { span.dot.nokey {} "no key" }
+                    span.lg { span.lead-swatch {} "answers first right now" }
                 }
-                p.muted { (p.kind.as_str()) " · " span.mono { (p.base_url) } }
-                div.row-actions {
-                    @if configured && !p.models.is_empty() {
-                        form.inline method="post" action="/ui/providers/test" {
-                            input type="hidden" name="provider" value=(p.name);
-                            button.ghost.small type="submit" { "Test connection" }
+            }
+            p.muted { "A request for an alias goes to the first target, left to right, that is ready, can handle the request and is within quota." }
+            div.routes {
+                @for r in &cfg.routes {
+                    @let lead = r.targets.iter().position(|t| ready_of.get(t) == Some(&Readiness::Ready));
+                    div.route {
+                        div.route-name {
+                            span.mono.strong { (r.alias) }
+                            @if !r.description.is_empty() { span.muted.small { (r.description) } }
+                        }
+                        ol.chain {
+                            @for (i, t) in r.targets.iter().enumerate() {
+                                @let rd = ready_of.get(t).copied().unwrap_or(Readiness::NoKey);
+                                @let (pn, mid) = t.split_once('/').unwrap_or((t.as_str(), ""));
+                                li class={ "hop " (rd.class()) @if lead == Some(i) { " lead" } } title=(format!("{t}: {}", rd.label())) {
+                                    @if let Some(p) = provider_by_name.get(pn) { (provider_icon(p, true)) }
+                                    span.hop-text { span.hop-p { (pn) } span.hop-m.mono { (mid) } }
+                                    span class={ "dot " (rd.class()) } {}
+                                }
+                            }
                         }
                     }
-                    @if configured { a.button.ghost.small href=(format!("/ui/providers/{}/models", p.name)) { "Choose models" } }
                 }
-                @if needs_key {
-                    @if state.sealer.is_some() {
-                        details.keybox {
-                            summary { @if source == KeySource::Dashboard { "Replace API key" } @else { "Set API key" } }
-                            p.muted {
-                                "The key is encrypted before it is saved, takes effect immediately, and cannot be shown again."
-                                @if source == KeySource::Env { " It will be used instead of " span.mono { (p.api_key_env) } "." }
+            }
+        }
+
+        @for (tier, title, blurb) in [("local", "Local", "Run on your own machines. No key, no cost."), ("free", "Free tier", "Cloud providers used within their free quotas."), ("paid", "Paid", "Billed per token. Only keys allowed to spend can reach these.")] {
+            @let group: Vec<&crate::config::ProviderCfg> = cfg.providers.iter().filter(|p| p.tier.as_str() == tier).collect();
+            @if !group.is_empty() {
+                div.group-head {
+                    h2 { (title) span.count { (group.len()) } }
+                    span.muted.small { (blurb) }
+                }
+                @for p in group {
+                    @let needs_key = !p.api_key_env.is_empty();
+                    @let (configured, source) = configured_of.get(p.name.as_str()).copied().unwrap_or((false, KeySource::Unset));
+                    @let cooling = p.models.iter().filter(|m| ready_of.get(&format!("{}/{}", p.name, m.id)) == Some(&Readiness::Cooling)).count();
+                    section class={ "card prov " (brand(p).0) @if !configured { " off" } } {
+                        header.prov-head {
+                            (provider_icon(p, false))
+                            div.prov-id {
+                                div.prov-name { (p.name) " " (tier_badge(p.tier.as_str())) }
+                                div.prov-meta.muted { (p.kind.as_str()) " · " span.mono { (p.base_url) } }
                             }
-                            form.key-row method="post" action="/ui/providers/key" {
-                                input type="hidden" name="provider" value=(p.name);
-                                input type="password" name="key" placeholder="Paste the provider API key" autocomplete="off" spellcheck="false" required maxlength="500";
-                                button.primary type="submit" { "Save key" }
+                            div.prov-state {
+                                @if !needs_key { (badge("ok", "no key needed")) }
+                                @else if source == KeySource::Dashboard {
+                                    @let hint = stored.get(&p.name).map(|s| s.0.as_str()).unwrap_or("");
+                                    (badge("ok", &if hint.is_empty() { "key saved here".to_string() } else { format!("key saved here ····{hint}") }))
+                                }
+                                @else if source == KeySource::Env { (badge("ok", &format!("key from {}", p.api_key_env))) }
+                                @else { (badge("bad", "no API key")) }
+                                span.muted.small {
+                                    (p.models.len()) @if p.models.len() == 1 { " model" } @else { " models" }
+                                    @if cooling > 0 { " · " (cooling) " cooling down" }
+                                }
                             }
-                            @if source == KeySource::Dashboard {
-                                form.inline method="post" action="/ui/providers/key/remove" data-confirm=(format!("Remove the saved key for {}?", p.name)) {
+                        }
+                        div.row-actions {
+                            @if configured && !p.models.is_empty() {
+                                form.inline method="post" action="/ui/providers/test" {
                                     input type="hidden" name="provider" value=(p.name);
-                                    button.ghost.small.danger type="submit" { "Remove saved key" }
+                                    button.small type="submit" { "Test connection" }
+                                }
+                            }
+                            @if configured { a.button.small href=(format!("/ui/providers/{}/models", p.name)) { "Choose models" } }
+                        }
+                        @if needs_key {
+                            @if state.sealer.is_some() {
+                                details.keybox {
+                                    summary { @if source == KeySource::Dashboard { "Replace API key" } @else if configured { "Set API key here" } @else { "Add API key to enable this provider" } }
+                                    p.muted {
+                                        "The key is encrypted before it is saved, takes effect immediately, and cannot be shown again."
+                                        @if source == KeySource::Env { " It will be used instead of " span.mono { (p.api_key_env) } "." }
+                                    }
+                                    form.key-row method="post" action="/ui/providers/key" {
+                                        input type="hidden" name="provider" value=(p.name);
+                                        input type="password" name="key" placeholder="Paste the provider API key" autocomplete="off" spellcheck="false" required maxlength="500";
+                                        button.primary type="submit" { "Save key" }
+                                    }
+                                    @if source == KeySource::Dashboard {
+                                        form.inline method="post" action="/ui/providers/key/remove" data-confirm=(format!("Remove the saved key for {}?", p.name)) {
+                                            input type="hidden" name="provider" value=(p.name);
+                                            button.ghost.small.danger type="submit" { "Remove saved key" }
+                                        }
+                                    }
+                                }
+                            } @else {
+                                p.muted.small { "To set this key from the dashboard, start Aegis with " span.mono { (crate::secrets::SECRET_ENV) } ". Until then it is read from " span.mono { (p.api_key_env) } "." }
+                            }
+                        }
+                        div.models {
+                            @for m in &p.models {
+                                @let key = format!("{}/{}", p.name, m.id);
+                                @let rd = ready_of.get(&key).copied().unwrap_or(Readiness::NoKey);
+                                @let v = views.get(&key).cloned().unwrap_or_default();
+                                div class={ "mrow " (rd.class()) } {
+                                    div.m-id {
+                                        span class={ "dot " (rd.class()) } title=(rd.label()) {}
+                                        span.mono.strong { (m.id) }
+                                        @for c in &m.capabilities { (badge("plain", c)) }
+                                    }
+                                    div.m-facts.muted.small { (compact(m.context_window)) " context · " (price(m)) }
+                                    div.m-use { (usage_view(&v, &m.limits)) }
+                                    div.m-state {
+                                        @if v.cooldown_secs > 0 {
+                                            (badge("warn", &format!("cooling {}s", v.cooldown_secs)))
+                                            form.inline method="post" action="/ui/providers/reset" {
+                                                input type="hidden" name="target" value=(key);
+                                                button.ghost.small type="submit" { "Clear" }
+                                            }
+                                        }
+                                    }
+                                    @if v.cooldown_secs > 0 || v.remaining_requests.is_some() || v.last_error.is_some() {
+                                        div.m-notes {
+                                            @if v.cooldown_secs > 0 { p.muted.small { "Reason: " (v.cooldown_reason) } }
+                                            @if let Some(rem) = v.remaining_requests { p.muted.small { "Provider reports " (int(rem as i64)) " requests remaining" @if let Some(t) = v.remaining_tokens { " and " (compact(t)) " tokens" } "." } }
+                                            @if let Some(e) = &v.last_error { p.err-text { "Last error: " (e) } }
+                                        }
+                                    }
                                 }
                             }
                         }
-                    } @else {
-                        p.muted { "To set this key from the dashboard, start Aegis with " span.mono { (crate::secrets::SECRET_ENV) } ". Until then it is read from " span.mono { (p.api_key_env) } "." }
-                    }
-                }
-                @for m in &p.models {
-                    @let key = format!("{}/{}", p.name, m.id);
-                    @let v = state.quota.view(&key);
-                    div.model {
-                        div.model-head {
-                            span.mono.strong { (m.id) }
-                            @for c in &m.capabilities { (badge("plain", c)) }
-                            span.muted { (compact(m.context_window)) " token context · " (price(m)) }
-                            @if v.cooldown_secs > 0 {
-                                (badge("bad", &format!("cooling down {}s", v.cooldown_secs)))
-                                form.inline method="post" action="/ui/providers/reset" {
-                                    input type="hidden" name="target" value=(key);
-                                    button.ghost.small type="submit" { "Clear" }
-                                }
-                            } @else if configured { (badge("ok", "available")) }
-                        }
-                        div.meters {
-                            (meter("Requests / min", v.rpm_used, m.limits.rpm))
-                            (meter("Requests / day", v.rpd_used, m.limits.rpd))
-                            (meter("Tokens / min", v.tpm_used, m.limits.tpm))
-                            (meter("Tokens / day", v.tpd_used, m.limits.tpd))
-                        }
-                        @if v.cooldown_secs > 0 { p.muted { "Reason: " (v.cooldown_reason) } }
-                        @if let Some(rem) = v.remaining_requests { p.muted { "Provider reports " (int(rem as i64)) " requests remaining" @if let Some(t) = v.remaining_tokens { " and " (compact(t)) " tokens" } "." } }
-                        @if let Some(e) = &v.last_error { p.err-text { "Last error: " (e) } }
                     }
                 }
             }
@@ -1214,6 +1352,68 @@ button.small{padding:3px 9px;font-size:12.5px}
 button:disabled{opacity:.6;cursor:progress}
 form.inline{display:inline}
 .row-actions{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0}
+.small{font-size:12.5px}
+.tile .v .of{font-size:15px;font-weight:500;color:var(--muted);letter-spacing:0}
+.tile .v.warnv{color:var(--warn)}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;flex:none;background:var(--muted)}
+.dot.ready{background:var(--ok);box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 18%,transparent)}
+.dot.cooling{background:var(--warn);box-shadow:0 0 0 3px color-mix(in srgb,var(--warn) 22%,transparent)}
+.dot.nokey{background:transparent;border:1.5px solid var(--muted)}
+.picon{--b:var(--ink);width:40px;height:40px;border-radius:11px;display:grid;place-items:center;flex:none;font-weight:700;font-size:17px;color:var(--b);background:color-mix(in srgb,var(--b) 11%,var(--panel));border:1px solid color-mix(in srgb,var(--b) 22%,var(--line))}
+.picon svg{width:22px;height:22px;fill:currentColor;display:block}
+.picon.sm{width:20px;height:20px;border-radius:6px;font-size:11px;border:0}
+.picon.sm svg{width:12px;height:12px}
+.b-gemini .picon,.picon.b-gemini{--b:#7b6fd0}.b-anthropic .picon,.picon.b-anthropic{--b:#c2603f}
+.b-groq .picon,.picon.b-groq{--b:#e0492d}.b-openai .picon,.picon.b-openai{--b:var(--ink)}
+.b-ollama .picon,.picon.b-ollama{--b:var(--ink)}.picon.b-other{--b:var(--accent)}
+@media (prefers-color-scheme:dark){.picon.b-gemini{--b:#a99cf0}.picon.b-anthropic{--b:#e08a66}.picon.b-groq{--b:#ff7a5c}}
+.legend-row{display:flex;gap:14px;flex-wrap:wrap;font-size:12.5px;color:var(--muted)}
+.lg{display:inline-flex;align-items:center;gap:7px}
+.lead-swatch{width:16px;height:10px;border-radius:4px;border:1.5px solid var(--accent);background:color-mix(in srgb,var(--accent) 12%,transparent)}
+.routes{display:flex;flex-direction:column}
+.route{display:grid;grid-template-columns:minmax(150px,220px) minmax(0,1fr);gap:8px 20px;align-items:center;padding:12px 0;border-top:1px solid var(--line)}
+.route-name{display:flex;flex-direction:column;gap:1px;min-width:0}
+.chain{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:8px 0;align-items:center}
+.hop{display:inline-flex;align-items:center;gap:8px;padding:5px 10px 5px 6px;border:1px solid var(--line);border-radius:10px;background:var(--bg);font-size:13px;max-width:100%}
+.hop+.hop{margin-left:26px;position:relative}
+.hop+.hop::before{content:"";position:absolute;left:-20px;top:50%;width:14px;height:1.5px;background:var(--line)}
+.hop+.hop::after{content:"";position:absolute;left:-10px;top:50%;width:6px;height:6px;border-top:1.5px solid var(--muted);border-right:1.5px solid var(--muted);transform:translateY(-50%) rotate(45deg);opacity:.7}
+.hop-text{display:inline-flex;gap:6px;align-items:baseline;min-width:0;flex-wrap:wrap}
+.hop-p{color:var(--muted);font-size:12px}.hop-m{font-weight:600;overflow-wrap:anywhere}
+.hop.nokey{border-style:dashed;opacity:.6}
+.hop.cooling{border-color:color-mix(in srgb,var(--warn) 55%,var(--line))}
+.hop.lead{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 9%,var(--panel));box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 10%,transparent)}
+.group-head{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin:30px 2px 0}
+.group-head h2{margin:0;font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);display:inline-flex;align-items:center;gap:8px}
+.count{display:inline-block;min-width:20px;text-align:center;padding:0 6px;border-radius:99px;background:var(--soft);color:var(--ink);font-size:12px;letter-spacing:0}
+.prov{margin-top:10px;padding:0;overflow:hidden}
+.prov>*{padding-left:20px;padding-right:20px}
+.prov-head{display:flex;align-items:center;gap:14px;padding-top:16px;padding-bottom:6px;flex-wrap:wrap}
+.prov-id{flex:1 1 240px;min-width:0}
+.prov-name{font-size:17px;font-weight:650;letter-spacing:-.01em;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.prov-meta{font-size:12.5px;overflow-wrap:anywhere}
+.prov-state{display:flex;flex-direction:column;align-items:flex-end;gap:3px}
+.prov .row-actions{margin:6px 0 4px}
+.prov .keybox{margin:4px 0 10px}
+.prov.off .keybox summary{color:var(--accent)}
+.models{margin-top:10px;padding:0!important;border-top:1px solid var(--line);background:color-mix(in srgb,var(--soft) 45%,var(--panel))}
+.mrow{display:grid;grid-template-columns:minmax(200px,1.1fr) minmax(140px,.75fr) minmax(0,2fr) auto;gap:6px 20px;align-items:center;padding:11px 20px;border-top:1px solid var(--line)}
+.mrow:first-child{border-top:0}
+.m-id{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
+.m-id .strong{overflow-wrap:anywhere}
+.m-state{display:flex;align-items:center;gap:6px;justify-content:flex-end;min-width:0}
+.m-notes{grid-column:1/-1}.m-notes p{margin:2px 0 0}
+.minis{display:grid;grid-template-columns:repeat(auto-fit,minmax(86px,1fr));gap:6px 12px}
+.mini-head{display:flex;justify-content:space-between;gap:8px;font-size:11.5px;color:var(--muted);white-space:nowrap}
+.mini .track{height:4px;margin-top:3px;background:color-mix(in srgb,var(--muted) 18%,transparent)}
+.prov.off .models{opacity:.55}
+@media (max-width:900px){
+  .route{grid-template-columns:1fr}
+  .mrow{grid-template-columns:1fr;gap:6px}
+  .m-state{justify-content:flex-start}
+  .prov-state{align-items:flex-start;flex-basis:100%}
+  .hop+.hop{margin-left:22px}
+}
 a.button{display:inline-block;text-decoration:none;border:1px solid var(--line);border-radius:8px;color:var(--ink)}
 a.button.small{padding:3px 9px;font-size:12.5px}
 .pick{display:flex;gap:6px;flex-wrap:wrap;align-items:center}

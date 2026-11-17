@@ -7,6 +7,7 @@ pub mod cache;
 pub mod config;
 pub mod db;
 pub mod gateway;
+pub mod icons;
 pub mod providers;
 pub mod quota;
 pub mod secrets;
